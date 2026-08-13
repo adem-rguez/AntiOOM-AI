@@ -1,0 +1,11 @@
+[package]
+name = "moe-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+backend-trait = { path = "../backend-trait" }
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true

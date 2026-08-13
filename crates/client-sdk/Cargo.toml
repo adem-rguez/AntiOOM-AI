@@ -1,0 +1,12 @@
+[package]
+name = "client-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proto = { path = "../proto" }
+tonic.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true

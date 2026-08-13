@@ -1,0 +1,11 @@
+[package]
+name = "pool-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proto = { path = "../proto" }
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true

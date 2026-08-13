@@ -1,0 +1,34 @@
+[package]
+name = "daemon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+backend-trait = { path = "../backend-trait" }
+llama-backend = { path = "../backends/llama-backend" }
+sd-backend = { path = "../backends/sd-backend" }
+whisper-backend = { path = "../backends/whisper-backend" }
+tts-backend = { path = "../backends/tts-backend" }
+video-backend = { path = "../backends/video-backend" }
+moe-cache = { path = "../moe-cache" }
+spec-decode = { path = "../spec-decode" }
+pool-protocol = { path = "../pool-protocol" }
+proto = { path = "../proto" }
+tokio.workspace = true
+tokio-stream = "0.1"
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+tonic.workspace = true
+prost.workspace = true
+bytes.workspace = true
+futures.workspace = true
+reqwest = { version = "0.12", features = ["json", "stream"] }
+sysinfo = "0.31"
+

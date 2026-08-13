@@ -1,0 +1,17 @@
+[package]
+name = "llama-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+backend-trait = { path = "../../backend-trait" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true
+reqwest = { version = "0.12", features = ["json"] }

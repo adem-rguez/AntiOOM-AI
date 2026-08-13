@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package aiatm.daemon.v1;
+
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_TEXT = 1;
+  MODALITY_IMAGE = 2;
+  MODALITY_AUDIO_ASR = 3;
+  MODALITY_AUDIO_TTS = 4;
+  MODALITY_EMBEDDING = 5;
+  MODALITY_VIDEO = 6;
+}
+
+message SamplingParams {
+  float temperature = 1;
+  float top_p = 2;
+  int32 top_k = 3;
+  uint32 max_tokens = 4;
+  repeated string stop_sequences = 5;
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  string prompt = 2;
+  Modality modality = 3;
+  SamplingParams sampling = 4;
+  bytes image_input = 5;
+}
+
+message GenerateResponse {
+  string request_id = 1;
+  string output_text = 2;
+  bytes output_data = 3;
+  uint32 tokens_generated = 4;
+  uint64 generation_time_ms = 5;
+}
+
+message StreamChunk {
+  string request_id = 1;
+  string delta_text = 2;
+  bytes delta_data = 3;
+  bool is_final = 4;
+}
+
+message LoadModelRequest {
+  string model_path = 1;
+  Modality modality = 2;
+  optional uint32 gpu_layers = 3;
+  optional uint32 context_size = 4;
+}
+
+message LoadModelResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 estimated_vram_bytes = 3;
+}
+
+message UnloadModelRequest {
+  string model_id = 1;
+}
+
+message UnloadModelResponse {
+  bool success = 1;
+}
+
+message StatusRequest {}
+
+message BackendStatus {
+  string name = 1;
+  bool loaded = 2;
+  string current_model = 3;
+  uint64 vram_used_bytes = 4;
+}
+
+message StatusResponse {
+  string version = 1;
+  uint64 total_vram_bytes = 2;
+  uint64 free_vram_bytes = 3;
+  repeated BackendStatus backends = 4;
+}
+
+service DaemonService {
+  rpc Generate (GenerateRequest) returns (GenerateResponse);
+  rpc GenerateStream (GenerateRequest) returns (stream StreamChunk);
+  rpc LoadModel (LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel (UnloadModelRequest) returns (UnloadModelResponse);
+  rpc GetStatus (StatusRequest) returns (StatusResponse);
+}

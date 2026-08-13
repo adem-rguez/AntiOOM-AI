@@ -1,0 +1,39 @@
+# AI model weights and local model assets (never commit)
+models/**
+*.gguf
+*.safetensors
+*.ckpt
+*.onnx
+*.bin
+
+# Private working plan (the public README remains tracked)
+/local-inference-daemon-plan.md
+
+# Rust build output and local toolchain configuration
+/target/
+/.cargo/config.toml
+
+# JavaScript/Electron build output and dependencies
+**/node_modules/
+**/dist/
+**/dist-ssr/
+
+# Local configuration, credentials, and logs
+.env
+.env.*
+!.env.example
+*.local
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.user
+*.swp

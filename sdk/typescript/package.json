@@ -1,0 +1,14 @@
+{
+  "name": "aiatm-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript/JavaScript Client SDK for AIATM Local Inference Daemon",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
