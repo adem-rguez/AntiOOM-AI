@@ -42,5 +42,5 @@ Thumbs.db
 CLAUDE.md
 /claude/
 /.claude/
-.github/agents/
+.claude/agents/
 copilot-instructions.md
