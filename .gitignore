@@ -37,3 +37,10 @@ Thumbs.db
 *.suo
 *.user
 *.swp
+
+# Claude Code local metadata and working files
+CLAUDE.md
+/claude/
+/.claude/
+.github/agents/
+copilot-instructions.md

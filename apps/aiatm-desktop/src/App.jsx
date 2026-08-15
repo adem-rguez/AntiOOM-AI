@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
-  MessageSquare, Sparkles, Volume2, Video, Calculator, Network, 
-  Cpu, HardDrive, Zap, Send, Play, Image, Server, FileAudio, RefreshCw,
+  MessageSquare, Sparkles, Volume2, Video,
+  Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
   CheckCircle2, XCircle, PackagePlus, Box, Paperclip, X
 } from 'lucide-react';
@@ -159,9 +159,6 @@ export default function App() {
   const [audioSrc, setAudioSrc] = useState(null);
   const [isGeneratingTts, setIsGeneratingTts] = useState(false);
 
-  // Fit Estimator State
-  const [fitParams, setFitParams] = useState(8.0);
-  const [fitQuant, setFitQuant] = useState('Q4_K_M');
   // Default values used by the fit preview and new model configuration.
   const [gpuLayers, setGpuLayers] = useState(99);
   const [contextSize, setContextSize] = useState(4096);
@@ -559,25 +556,6 @@ export default function App() {
     }
   };
 
-  const handleCalculateFit = async () => {
-    try {
-      const res = await fetch('http://127.0.0.1:8080/v1/fit-estimator', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parameter_count_billions: parseFloat(fitParams),
-          quantization: fitQuant,
-          context_size: 8192,
-          modality: 'Text'
-        })
-      });
-      const data = await res.json();
-      setFitResult(data);
-    } catch (e) {
-      alert('Fit calculation error: ' + e);
-    }
-  };
-
   const totalRam = parseFloat(sysInfo.total_ram_gb) || 16.0;
   const freeRam = parseFloat(sysInfo.free_ram_gb) || 10.0;
   const usedRam = totalRam - freeRam;
@@ -803,20 +781,6 @@ export default function App() {
           </div>
           </>)}
 
-          <div className="nav-section" style={{ marginTop: '0.5rem' }}>TOOLS & MANAGEMENT</div>
-          <button
-            className={`nav-btn ${activeTab === 'fit' ? 'active' : ''}`}
-            onClick={() => setActiveTab('fit')}
-          >
-            <Calculator size={17} /> Fit Estimator
-          </button>
-
-          <button
-            className={`nav-btn ${activeTab === 'nodes' ? 'active' : ''}`}
-            onClick={() => setActiveTab('nodes')}
-          >
-            <Network size={17} /> LAN Node Topology
-          </button>
         </div>
 
         {/* Main Tab Panels */}
@@ -1129,92 +1093,6 @@ export default function App() {
             </div>
           )}
 
-          {/* 5. Fit Estimator */}
-          {activeTab === 'fit' && (
-            <div className="tab-panel">
-              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Pre-Download Model Fit Estimator</h2>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-                Hardware compatibility calculator
-              </p>
-
-              <div className="grid-2">
-                <div className="card">
-                  <div className="form-group">
-                    <label>Parameter Count (Billions)</label>
-                    <input
-                      type="number"
-                      value={fitParams}
-                      onChange={e => setFitParams(e.target.value)}
-                    />
-                  </div>
-
-                  <div className="form-group">
-                    <label>Quantization</label>
-                    <select value={fitQuant} onChange={e => setFitQuant(e.target.value)}>
-                      <option value="Q8_0">Q8_0 (High Quality - 8 bit)</option>
-                      <option value="Q4_K_M">Q4_K_M (Balanced - 4 bit)</option>
-                      <option value="F16">F16 (Full Precision - 16 bit)</option>
-                    </select>
-                  </div>
-
-                  <button className="btn-primary" onClick={handleCalculateFit}>
-                    <Calculator size={16} /> Calculate Hardware Compatibility
-                  </button>
-                </div>
-
-                <div className="card">
-                  <h3>Compatibility Report</h3>
-                  <br />
-                  {fitResult ? (
-                    <div>
-                      <p style={{ fontSize: '1.1rem', marginBottom: '0.5rem' }}>
-                        Status:{' '}
-                        <strong style={{ color: fitResult.fits_in_vram ? 'var(--accent-green)' : '#ef4444' }}>
-                          {fitResult.fits_in_vram ? 'FITS IN GPU VRAM' : 'EXCEEDS VRAM (OFFLOADS TO RAM)'}
-                        </strong>
-                      </p>
-                      <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
-                        Required VRAM: <strong>{(fitResult.total_required_vram_bytes / 1e9).toFixed(2)} GB</strong>
-                      </p>
-                      <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
-                        Estimated Speed: <strong>{fitResult.estimated_tok_per_sec} tok/sec</strong>
-                      </p>
-                    </div>
-                  ) : (
-                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-                      Click calculate to view hardware allocation report.
-                    </p>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* 6. LAN Topology */}
-          {activeTab === 'nodes' && (
-            <div className="tab-panel">
-              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Heterogeneous LAN Node Topology</h2>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-                Device Pooling Network Topology
-              </p>
-
-              <div className="card">
-                <h3>Registered Cluster Nodes</h3>
-                <br />
-                <div className="card" style={{ background: 'var(--bg-dark)', maxWidth: '300px' }}>
-                  <div style={{ fontWeight: '700', color: 'var(--accent-blue)' }}>
-                    <Server size={16} /> local-node-primary
-                  </div>
-                  <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.3rem' }}>
-                    Address: 127.0.0.1:50051
-                  </div>
-                  <div style={{ fontSize: '0.85rem', color: 'var(--accent-green)', marginTop: '0.3rem' }}>
-                    Free VRAM: 12.8 / 16.0 GB
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
         </main>
       </div>
     </div>
