@@ -16,7 +16,7 @@ const projectRoot = join(root, '..', '..');
 const distIndex = join(root, 'dist', 'index.html');
 const electronBin = join(root, 'node_modules', 'electron', 'dist', 'electron.exe');
 const viteBin = join(root, 'node_modules', '.bin', 'vite.cmd');
-const daemonBin = process.env.ANTIOOM_DAEMON_PATH || join(process.env.USERPROFILE || '', 'aiatm_target', 'debug', 'daemon-core.exe');
+const daemonBin = process.env.ANTIOOM_DAEMON_PATH || join(projectRoot, 'target', 'release', 'daemon-core.exe');
 const modelsDir = join(projectRoot, 'models');
 
 function daemonIsReady() {

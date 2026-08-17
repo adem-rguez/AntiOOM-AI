@@ -959,7 +959,7 @@ export default function App() {
                 setModelPath(e.target.value);
                 setConfigTarget(current => ({ ...current, model_path: e.target.value }));
               }}
-              placeholder="C:\path\to\model.gguf"
+              placeholder="C:\path\to\model file"
               style={{ marginTop: '0.4rem' }}
             />
           </div>
@@ -1272,7 +1272,7 @@ export default function App() {
                           <span className="modal-list-item-meta">{model.modality?.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</span>
                         </button>
                       ))}
-                    {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No GGUF models found in AIATM's models folder.</p>}
+                    {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in AIATM's models folder.</p>}
                   </div>
                 </div>
               </div>

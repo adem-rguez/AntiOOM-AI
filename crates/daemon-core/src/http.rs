@@ -1760,6 +1760,7 @@ fn has_image_projector(path: &std::path::Path) -> bool {
 
 fn detect_model_modality(path: &std::path::Path) -> String {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
     match extension.as_str() {
         "gguf" => {
             use std::io::Read;
@@ -1772,8 +1773,36 @@ fn detect_model_modality(path: &std::path::Path) -> String {
                 "text".to_string()
             }
         }
-        "safetensors" | "ckpt" => "image".to_string(),
-        "bin" | "onnx" => "audio".to_string(),
+        "safetensors" | "ckpt" => {
+            if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") {
+                "audio".to_string()
+            } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") {
+                "tts".to_string()
+            } else {
+                "image".to_string()
+            }
+        }
+        "pth" | "pt" => {
+            if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") || file_name.contains("tacotron") || file_name.contains("fastspeech") {
+                "tts".to_string()
+            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
+                "audio".to_string()
+            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("vae") || file_name.contains("unet") {
+                "image".to_string()
+            } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
+                "video".to_string()
+            } else {
+                "text".to_string()
+            }
+        }
+        "bin" | "onnx" => {
+            if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("piper") {
+                "tts".to_string()
+            } else {
+                "audio".to_string()
+            }
+        }
+        "ot" | "tflite" | "mlmodel" | "engine" => "text".to_string(),
         "mp4" | "webm" => "video".to_string(),
         _ => "unknown".to_string(),
     }
@@ -1858,7 +1887,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
         let path = child.path();
         if path.is_dir() {
             collect_model_files(&path, entries);
-        } else if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gguf" | "safetensors" | "ckpt" | "onnx")) {
+        } else if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gguf" | "safetensors" | "ckpt" | "onnx" | "pth" | "pt" | "bin" | "ot" | "tflite" | "mlmodel" | "engine")) {
             // Skip mmproj companion files — they are not standalone models
             let file_name_lower = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
             if file_name_lower.contains("mmproj") {
