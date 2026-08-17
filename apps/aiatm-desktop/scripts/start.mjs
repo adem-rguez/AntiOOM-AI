@@ -95,10 +95,30 @@ const watcher = spawn(
 );
 
 // --- Cleanup on exit ---
-function shutdown() {
+async function shutdown() {
   console.log('\n[LAUNCHER] Shutting down...');
   try { watcher.kill(); } catch {}
   try { electron.kill(); } catch {}
+  // On Windows, call daemon's graceful shutdown endpoint before killing.
+  // This ensures Job Objects are closed and children are terminated before
+  // TerminateProcess abruptly kills the daemon.
+  if (daemon && process.platform === 'win32') {
+    try {
+      await new Promise((resolve, reject) => {
+        http.get('http://127.0.0.1:8080/health', response => {
+          if (response.statusCode === 200) {
+            // Daemon is alive; try to shut it down gracefully
+            console.log('[LAUNCHER] Sending graceful shutdown signal to daemon');
+            http.get('http://127.0.0.1:8080/shutdown', {}, () => {}).on('error', () => {});
+            setTimeout(resolve, 500);
+          } else {
+            resolve();
+          }
+        }).on('error', () => resolve());
+        setTimeout(resolve, 750);
+      });
+    } catch {}
+  }
   try { daemon?.kill(); } catch {}
   process.exit(0);
 }

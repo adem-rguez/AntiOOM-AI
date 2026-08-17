@@ -158,6 +158,121 @@ body {
   overflow-y: auto;
 }
 
+/* Configure Model Sidebar (left overlay) */
+.config-sidebar-backdrop {
+  position: fixed;
+  inset: 52px 0 0 0;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+  z-index: 150;
+  animation: config-fade-in 0.18s ease-out;
+}
+
+.config-sidebar {
+  position: fixed;
+  right: 0;
+  top: 52px;
+  bottom: 0;
+  width: 360px;
+  max-width: 90vw;
+  background: #0b1120;
+  border-left: 1px solid var(--border-color);
+  box-shadow: -6px 0 24px rgba(0, 0, 0, 0.5);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  animation: config-slide-in-right 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  user-select: none;
+}
+
+@keyframes config-slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes config-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.config-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.1rem;
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.config-sidebar-title {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+
+.config-sidebar-title svg {
+  color: var(--accent-blue);
+}
+
+.config-sidebar-close {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.3rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.config-sidebar-close:hover {
+  background: var(--card-bg);
+  color: var(--text-primary);
+  border-color: var(--border-highlight);
+}
+
+.config-sidebar-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 1.1rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.config-sidebar-load {
+  width: 100%;
+  justify-content: center;
+  margin-top: 0.25rem;
+}
+
+.config-sidebar-section-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 0.5rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.config-sidebar-loaded-row {
+  border-bottom: 1px solid var(--border-color);
+  padding: 0.7rem 0;
+}
+
+.config-sidebar-loaded-meta {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin: 0.2rem 0 0.5rem;
+}
+
 
 .nav-section {
   font-size: 0.65rem;
@@ -195,6 +310,133 @@ body {
   color: var(--accent-blue);
   font-weight: 600;
   border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+/* Studio session row: click target + hover-revealed actions */
+.chat-session-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding-right: 0.4rem;
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+.chat-session-row.fading-out {
+  opacity: 0;
+  transform: translateX(-8px) scale(0.98);
+  pointer-events: none;
+}
+.chat-session-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.chat-session-main:hover {
+  background-color: var(--card-bg);
+  color: var(--text-primary);
+}
+.chat-session-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-session-actions {
+  display: flex;
+  gap: 0.15rem;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.chat-session-row:hover .chat-session-actions,
+.chat-session-row.active .chat-session-actions {
+  opacity: 1;
+}
+.chat-session-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.25rem;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.chat-session-action:hover {
+  color: var(--text-primary);
+  background-color: var(--card-bg);
+}
+.chat-session-action.delete:hover {
+  color: #ef4444;
+}
+.chat-session-row.editing .chat-session-actions,
+.chat-session-row.pending-delete .chat-session-actions {
+  opacity: 1;
+}
+.chat-session-edit-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 1px solid var(--border-highlight);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font: inherit;
+  padding: 0 0.4rem;
+  outline: none;
+}
+.chat-session-edit-input:focus {
+  border-color: var(--accent-blue);
+}
+.chat-session-action.delete.confirm {
+  color: #ef4444;
+  background-color: rgba(239, 68, 68, 0.12);
+}
+.chat-session-action .confirm-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0 0.15rem;
+  letter-spacing: 0.02em;
+}
+
+/* Studio model-group header: toggle + delete-all-studios (hover-revealed) */
+.studio-group-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding-right: 0.4rem;
+  border-radius: 8px;
+  transition: background-color 0.15s ease;
+}
+.studio-group-row:hover {
+  background-color: var(--card-bg);
+}
+.studio-group-toggle {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  background: none;
+}
+.studio-group-toggle:hover {
+  background: none;
+  color: var(--text-primary);
+}
+.studio-group-actions {
+  display: flex;
+  gap: 0.15rem;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.studio-group-row:hover .studio-group-actions,
+.studio-group-row.pending-delete .studio-group-actions {
+  opacity: 1;
 }
 
 /* Content Area */

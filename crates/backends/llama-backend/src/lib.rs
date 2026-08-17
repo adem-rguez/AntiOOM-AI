@@ -5,26 +5,33 @@ use backend_trait::{
     InferenceStream, LoadOptions, Modality, VramEstimate,
 };
 use futures::stream;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{info, warn};
+use base64::Engine;
+
+pub mod process_tracker;
+use process_tracker::ChildRegistry;
+
+/// Legacy / single-model slot in the global child tracker.
+const LEGACY_KEY: &str = "legacy";
 
 pub struct LlamaBackend {
     model_path: Option<PathBuf>,
     is_loaded: Arc<AtomicBool>,
     supported_modalities: Vec<Modality>,
-    server_process: Arc<Mutex<Option<Child>>>,
+    children: Arc<ChildRegistry>,
     server_port: u16,
 }
 
 impl LlamaBackend {
-    pub fn new() -> Self {
+    pub fn new(children: Arc<ChildRegistry>) -> Self {
         Self {
             model_path: None,
             is_loaded: Arc::new(AtomicBool::new(false)),
             supported_modalities: vec![Modality::Text, Modality::Embedding],
-            server_process: Arc::new(Mutex::new(None)),
+            children,
             server_port: 50052,
         }
     }
@@ -33,7 +40,7 @@ impl LlamaBackend {
         let lmstudio_dir = std::env::var("USERPROFILE")
             .map(|p| PathBuf::from(p).join(".lmstudio\\extensions\\backends"))
             .ok()?;
-        
+
         if let Ok(entries) = std::fs::read_dir(lmstudio_dir) {
             for entry in entries.flatten() {
                 let candidate = entry.path().join("llama-server.exe");
@@ -44,20 +51,26 @@ impl LlamaBackend {
         }
         None
     }
+
+    /// Look for a sibling `mmproj*.gguf` next to the model file. Used to auto-enable
+    /// vision input when llama-server is launched against a multimodal model.
+    fn find_sibling_mmproj(model_path: &Path) -> Option<PathBuf> {
+        let dir = model_path.parent()?;
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.contains("mmproj") && name.ends_with(".gguf") {
+                return Some(entry.path());
+            }
+        }
+        None
+    }
 }
 
 impl Default for LlamaBackend {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for LlamaBackend {
-    fn drop(&mut self) {
-        let mut lock = self.server_process.lock().unwrap();
-        if let Some(mut child) = lock.take() {
-            let _ = child.kill();
-        }
+        // No registry available in default; tests should not spawn children.
+        Self::new(Arc::new(ChildRegistry::new()))
     }
 }
 
@@ -110,13 +123,8 @@ impl InferenceBackend for LlamaBackend {
             options.context_size
         );
 
-        // Kill existing server if running
-        {
-            let mut lock = self.server_process.lock().unwrap();
-            if let Some(mut child) = lock.take() {
-                let _ = child.kill();
-            }
-        }
+        // Kill existing server if running (tracked in the global child registry)
+        let _ = self.children.take(LEGACY_KEY);
 
         if let Some(server_bin) = Self::find_llama_server_binary() {
             info!("Found native CUDA llama-server binary at: {}", server_bin.display());
@@ -124,8 +132,8 @@ impl InferenceBackend for LlamaBackend {
             let ctx_size = options.context_size.unwrap_or(4096).to_string();
             let port_str = self.server_port.to_string();
 
-            let child = Command::new(&server_bin)
-                .arg("-m")
+            let mut cmd = Command::new(&server_bin);
+            cmd.arg("-m")
                 .arg(model_path)
                 .arg("--port")
                 .arg(&port_str)
@@ -134,16 +142,20 @@ impl InferenceBackend for LlamaBackend {
                 .arg("-c")
                 .arg(&ctx_size)
                 .arg("--host")
-                .arg("127.0.0.1")
-                .spawn();
+                .arg("127.0.0.1");
+            if let Some(mmproj_path) = Self::find_sibling_mmproj(model_path) {
+                info!("Auto-detected vision projector: {}", mmproj_path.display());
+                cmd.arg("--mmproj").arg(&mmproj_path);
+            }
+
+            let child = cmd.spawn();
 
             match child {
                 Ok(c) => {
                     info!("Spawned llama-server process (PID: {}). Waiting for startup...", c.id());
-                    {
-                        let mut lock = self.server_process.lock().unwrap();
-                        *lock = Some(c);
-                    }
+                    // Hand ownership of the Child to the registry so Drop / shutdown
+                    // can terminate it. Do not let it fall out of scope here.
+                    self.children.register(LEGACY_KEY.to_string(), c);
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
                 Err(e) => {
@@ -164,10 +176,8 @@ impl InferenceBackend for LlamaBackend {
     async fn unload_model(&mut self) -> Result<(), BackendError> {
         if self.is_loaded.load(Ordering::SeqCst) {
             info!("Unloading llama.cpp model from memory");
-            let mut lock = self.server_process.lock().unwrap();
-            if let Some(mut child) = lock.take() {
-                let _ = child.kill();
-            }
+            // `take` terminates the tracked child (see process_tracker).
+            let _ = self.children.take(LEGACY_KEY);
             self.model_path = None;
             self.is_loaded.store(false, Ordering::SeqCst);
         }
@@ -202,9 +212,32 @@ impl InferenceBackend for LlamaBackend {
         let (generated_text, tokens) = if let Some(messages) = &request.messages {
             // ── Use /v1/chat/completions so llama-server applies the model's native
             //    Jinja chat template (which injects <think> for Qwen3 reasoning). ──
+            // Extract image bytes up front to avoid overlapping borrows on `request`.
+            let image_bytes = request.image_input.as_deref();
+            // Per OpenAI convention, attach images to the LAST user message only.
+            let last_user_idx = messages.iter().rposition(|m| m.role == "user");
             let chat_messages: Vec<serde_json::Value> = messages
                 .iter()
-                .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+                .enumerate()
+                .map(|(i, m)| {
+                    let attach_image = image_bytes.is_some()
+                        && m.role == "user"
+                        && Some(i) == last_user_idx;
+                    if let (Some(bytes), true) = (image_bytes, attach_image) {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        serde_json::json!({
+                            "role": m.role,
+                            "content": [
+                                {"type": "text", "text": m.content},
+                                {"type": "image_url", "image_url": {
+                                    "url": format!("data:image/png;base64,{}", b64)
+                                }}
+                            ]
+                        })
+                    } else {
+                        serde_json::json!({ "role": m.role, "content": m.content })
+                    }
+                })
                 .collect();
 
             let payload = serde_json::json!({

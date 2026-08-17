@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU16;
-use llama_backend::LlamaBackend;
+use llama_backend::{process_tracker::ChildRegistry, LlamaBackend};
 use sd_backend::SdBackend;
 use whisper_backend::WhisperBackend;
 use tts_backend::TtsBackend;
@@ -19,7 +19,7 @@ use pool_protocol::{ClusterPoolManager, PeerNode};
 use proto::daemon_service_server::DaemonServiceServer;
 use registry::BackendRegistry;
 use session::SessionManager;
-use tracing::info;
+use tracing::{info, warn};
 use vram::VramArbiter;
 
 #[tokio::main]
@@ -32,6 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Starting AIATM Local Inference Daemon v{}", env!("CARGO_PKG_VERSION"));
+
+    // 0. Child-process tracker — shared by the legacy backend and the
+    //    HTTP `/v1/model/load` path so spawned llama-server.exe processes
+    //    can be terminated on shutdown or on targeted unload.
+    let children = Arc::new(ChildRegistry::new());
 
     // 1. Probe Hardware & Initialize VRAM Arbiter
     let hardware_info = profiler::HardwareProfiler::probe();
@@ -56,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Initialize Backend Registry & Register plugins across all modalities
     let registry = Arc::new(BackendRegistry::new());
 
-    registry.register_backend(Box::new(LlamaBackend::new())).await;
+    registry.register_backend(Box::new(LlamaBackend::new(children.clone()))).await;
     info!("Registered backend plugin: llama.cpp (Text, Embedding)");
 
     registry.register_backend(Box::new(SdBackend::new())).await;
@@ -81,6 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         context_size: None,
     }));
 
+    // Shared shutdown signal: ctrl_c fires once and wakes both servers.
+    // broadcast::channel buffers the signal so a Ctrl+C that arrives before
+    // either server's shutdown future is polled is still delivered. Also used
+    // by the /shutdown HTTP endpoint for graceful shutdown from the launcher.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     let http_state = http::AppState {
         registry: registry.clone(),
         session_manager: session_manager.clone(),
@@ -89,25 +100,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loaded_models,
         next_port,
         active_model,
+        children: children.clone(),
+        shutdown_signal: shutdown_tx.clone(),
     };
     let app = http::create_router(http_state);
     let http_addr: SocketAddr = "0.0.0.0:8080".parse()?;
+    let rx_axum = shutdown_tx.subscribe();
+    let rx_grpc = shutdown_tx.subscribe();
 
+    let shutdown_tx_ctrlc = shutdown_tx.clone();
     tokio::spawn(async move {
-        info!("HTTP REST server & Web Dashboard listening on http://{}", http_addr);
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!("Ctrl+C received; initiating graceful shutdown");
+            let _ = shutdown_tx_ctrlc.send(());
+        } else {
+            warn!("ctrl_c listener exited without a signal");
+        }
     });
 
-    // 5. Start gRPC Daemon Service on 0.0.0.0:50051
+    // Also listen for SIGTERM (Unix). The Electron launcher's
+    // `daemon.kill()` on app exit sends SIGTERM on Unix; without this
+    // listener, the daemon would be terminated without running its
+    // graceful shutdown path — which means `drop(children)` at the end
+    // of main never fires and the spawned llama-server.exe children are
+    // orphaned. On Windows there's no SIGTERM, so this block is gated.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                let shutdown_tx_term = shutdown_tx.clone();
+                tokio::spawn(async move {
+                    if sigterm.recv().await.is_some() {
+                        info!("SIGTERM received; initiating graceful shutdown");
+                        let _ = shutdown_tx_term.send(());
+                    }
+                });
+            }
+            Err(e) => warn!("failed to install SIGTERM handler: {}", e),
+        }
+    }
+
+    // HTTP server runs in a detached spawn (original layout) and now also
+    // responds to ctrl_c via with_graceful_shutdown.
+    let axum_task = tokio::spawn(async move {
+        info!("HTTP REST server & Web Dashboard listening on http://{}", http_addr);
+        let listener = match tokio::net::TcpListener::bind(http_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("HTTP bind failed: {}", e);
+                return;
+            }
+        };
+        let mut rx = rx_axum;
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.recv().await;
+            })
+            .await
+        {
+            warn!("HTTP server stopped with error: {}", e);
+        }
+    });
+
+    // 5. Start gRPC Daemon Service on 0.0.0.0:50051 — runs in foreground
+    //    (matches original layout) and now also responds to ctrl_c.
     let grpc_addr: SocketAddr = "0.0.0.0:50051".parse()?;
     let grpc_service = grpc::DaemonGrpcService::new(registry.clone(), vram_arbiter.clone());
-
     info!("gRPC Daemon server listening on {}", grpc_addr);
+    let mut rx = rx_grpc;
     tonic::transport::Server::builder()
         .add_service(DaemonServiceServer::new(grpc_service))
-        .serve(grpc_addr)
+        .serve_with_shutdown(grpc_addr, async move {
+            let _ = rx.recv().await;
+        })
         .await?;
+
+    // gRPC ended (either errored or via shutdown). Let axum finish too.
+    let _ = axum_task.await;
+
+    // Explicit drop: the axum task has already dropped its AppState (and the
+    // BackendRegistry within it), so this is the last outstanding
+    // Arc<ChildRegistry> clone. Dropping it runs the registry's Drop impl,
+    // which kills every still-tracked llama-server child before main returns.
+    drop(children);
 
     Ok(())
 }

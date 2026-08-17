@@ -3,7 +3,7 @@ import {
   MessageSquare, Sparkles, Volume2, Video,
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
-  CheckCircle2, XCircle, PackagePlus, Box, Paperclip, X
+  CheckCircle2, XCircle, PackagePlus, Box, Paperclip, X, Pencil
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -94,6 +94,19 @@ function ThinkingBlock({ thinkText, hadThinkTag }) {
   );
 }
 
+// Stable identity for a loaded model. Backend model_ids are timestamped
+// (mdl-{millis}-{port}), so reloading the same file yields a new id. The file's
+// basename is the only thing that survives across loads; normalize it so
+// backslash vs forward slash, casing, and quantization-tag drift all collapse
+// to the same key.
+function canonicalStudioKey(modelPath, modelName) {
+  const raw = (modelPath || modelName || '').toString();
+  const basename = raw.split(/[\\/]/).pop() || raw;
+  const stripped = basename.replace(/\.(gguf|safetensors|onnx|bin|ckpt)$/i, '');
+  const cleaned = stripped.toLowerCase().replace(/\s+/g, '-').trim();
+  return cleaned || raw;
+}
+
 function AttachmentPreview({ attachment }) {
   if (attachment.type.startsWith('image/')) {
     return <img className="chat-attachment-image" src={attachment.dataUrl} alt={attachment.name} />;
@@ -169,10 +182,134 @@ export default function App() {
   const [selectedModelId, setSelectedModelId] = useState(null); // which model chat uses
   const [openStudios, setOpenStudios] = useState([]); // { modelId, name, modality }
   const [chatSessions, setChatSessions] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('aiatm.chat-sessions')) ?? []; } catch { return []; }
+    try {
+      const stored = JSON.parse(localStorage.getItem('aiatm.chat-sessions'));
+      if (!Array.isArray(stored)) return [];
+      // One-time migration: stamp studioKey on legacy sessions that predate
+      // canonical keying. Older items lack modelPath; fall back to modelName.
+      let migrated = false;
+      const result = stored.map(item => {
+        if (!item) return item;
+        if (item.studioKey) return item;
+        const studioKey = canonicalStudioKey(item.modelPath, item.modelName || item.modelId);
+        const modelName = item.modelName
+          || (item.modelPath ? item.modelPath.split(/[\\/]/).pop() : '')
+          || (item.modelId ? item.modelId : '')
+          || 'Local model';
+        migrated = true;
+        return { ...item, modelName, studioKey };
+      });
+      if (migrated) {
+        try { localStorage.setItem('aiatm.chat-sessions', JSON.stringify(result)); } catch {}
+      }
+      return result;
+    } catch { return []; }
   });
   const [activeChatId, setActiveChatId] = useState(null);
-  const [expandedStudioGroups, setExpandedStudioGroups] = useState({});
+  const [collapsedStudios, setCollapsedStudios] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('aiatm.studio-collapsed')) ?? {}; } catch { return {}; }
+  });
+  const [editingSessionId, setEditingSessionId] = useState(null);
+  const [editValue, setEditValue] = useState('');
+  const [pendingDeleteId, setPendingDeleteId] = useState(null);
+  const [pendingDeleteModelKey, setPendingDeleteModelKey] = useState(null);
+
+  useEffect(() => {
+    if (!pendingDeleteId) return;
+    const id = setTimeout(() => setPendingDeleteId(null), 3500);
+    return () => clearTimeout(id);
+  }, [pendingDeleteId]);
+
+  useEffect(() => {
+    if (!pendingDeleteModelKey) return;
+    const id = setTimeout(() => setPendingDeleteModelKey(null), 3500);
+    return () => clearTimeout(id);
+  }, [pendingDeleteModelKey]);
+
+  // Rename animation: keep a displayed-name per session id, separate from
+  // chat.title, so we can walk letter-by-letter from old to new on rename.
+  const [displayedTitles, setDisplayedTitles] = useState({});
+  const prevTitlesRef = useRef({});
+  const animIntervalsRef = useRef({});
+  // Session ids queued for fade-out before being dropped from chatSessions.
+  const [pendingRemoveIds, setPendingRemoveIds] = useState([]);
+
+  // Keep displayedTitles in sync with the chatSessions list (additions/removals).
+  useEffect(() => {
+    const sessionIds = new Set(chatSessions.map(session => session.id));
+    setDisplayedTitles(current => {
+      const next = { ...current };
+      let changed = false;
+      for (const session of chatSessions) {
+        if (!(session.id in next)) {
+          next[session.id] = session.title;
+          changed = true;
+        }
+      }
+      for (const id of Object.keys(next)) {
+        if (!sessionIds.has(id)) {
+          delete next[id];
+          delete prevTitlesRef.current[id];
+          if (animIntervalsRef.current[id]) {
+            clearInterval(animIntervalsRef.current[id]);
+            delete animIntervalsRef.current[id];
+          }
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    for (const session of chatSessions) {
+      if (!(session.id in prevTitlesRef.current)) {
+        prevTitlesRef.current[session.id] = session.title;
+      }
+    }
+  }, [chatSessions]);
+
+  // When a session's title changes, walk from the old title to the new one
+  // letter-by-letter over ~1.5s. Only fires on actual title changes — initial
+  // mount and same-title re-renders are skipped via prevTitlesRef.
+  useEffect(() => {
+    const prevTitles = prevTitlesRef.current;
+    for (const session of chatSessions) {
+      const prev = prevTitles[session.id];
+      if (prev === undefined || prev === session.title) continue;
+      const oldTitle = prev;
+      const newTitle = session.title;
+      prevTitles[session.id] = session.title;
+
+      if (animIntervalsRef.current[session.id]) {
+        clearInterval(animIntervalsRef.current[session.id]);
+      }
+
+      const maxLen = Math.max(oldTitle.length, newTitle.length, 1);
+      const stepMs = Math.max(40, Math.floor(1500 / maxLen));
+      let step = 0;
+
+      const tick = () => {
+        step++;
+        if (step > maxLen) {
+          clearInterval(animIntervalsRef.current[session.id]);
+          delete animIntervalsRef.current[session.id];
+          setDisplayedTitles(current => ({ ...current, [session.id]: newTitle }));
+          return;
+        }
+        const revealed = newTitle.slice(0, step);
+        const remaining = oldTitle.slice(step);
+        setDisplayedTitles(current => ({ ...current, [session.id]: revealed + remaining }));
+      };
+
+      animIntervalsRef.current[session.id] = setInterval(tick, stepMs);
+    }
+  }, [chatSessions]);
+
+  // Clear any in-flight rename intervals when the app unmounts.
+  useEffect(() => () => {
+    for (const id in animIntervalsRef.current) {
+      clearInterval(animIntervalsRef.current[id]);
+    }
+  }, []);
+
   const [configTarget, setConfigTarget] = useState(null);
   const [isLoadingModel, setIsLoadingModel] = useState(false);
   const [unloadingModelId, setUnloadingModelId] = useState(null);
@@ -182,6 +319,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('aiatm.chat-sessions', JSON.stringify(chatSessions));
   }, [chatSessions]);
+
+  useEffect(() => {
+    localStorage.setItem('aiatm.studio-collapsed', JSON.stringify(collapsedStudios));
+  }, [collapsedStudios]);
 
   // Model preset catalog
   const MODEL_PRESETS = [
@@ -314,7 +455,7 @@ export default function App() {
           name: modelName,
           modality,
         }]);
-    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelName, modality, messages: initialMessages, createdAt: Date.now() };
+    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, modality, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now() };
     setChatSessions(current => [...current, session]);
     setActiveChatId(chatId);
     setMessages(initialMessages);
@@ -338,11 +479,12 @@ export default function App() {
       if (title) setChatSessions(current => current.map(session => session.id === sessionId ? { ...session, title } : session));
     } catch {}
   };
+  const activeLoadedModel = loadedModels[0] ?? null;
   const modelStatus = {
-    is_loaded: Boolean(selectedModel),
-    model_path: selectedModel?.model_path,
-    gpu_layers: selectedModel?.gpu_layers,
-    context_size: selectedModel?.context_size,
+    is_loaded: Boolean(activeLoadedModel),
+    model_path: activeLoadedModel?.model_path,
+    gpu_layers: activeLoadedModel?.gpu_layers,
+    context_size: activeLoadedModel?.context_size,
   };
 
 
@@ -410,6 +552,7 @@ export default function App() {
     let answerBuf = '';
     let inThinkingPhase = true; // reasoning_content comes before content
     let tokenCount = 0;
+    let finishReason = null;
     const startTime = Date.now();
 
     const updateMsg = (done = false) => {
@@ -424,7 +567,7 @@ export default function App() {
       syncMessages(prev =>
         prev.map(m =>
           m.id === aiId
-            ? { ...m, content: combined, loading: !done, telemetry: telemetry }
+            ? { ...m, content: combined, loading: !done, telemetry: telemetry, truncated: done && finishReason === 'length' }
             : m
         )
       );
@@ -465,7 +608,9 @@ export default function App() {
 
           try {
             const chunk = JSON.parse(raw);
-            const delta = chunk?.choices?.[0]?.delta ?? {};
+            const choice = chunk?.choices?.[0] ?? {};
+            const delta = choice.delta ?? {};
+            if (choice.finish_reason) finishReason = choice.finish_reason;
 
             let chunkAdded = false;
             if (delta.reasoning_content != null) {
@@ -625,28 +770,136 @@ export default function App() {
           <div className="nav-section" style={{ marginTop: '1rem' }}>STUDIOS</div>
           {chatSessions.length === 0 ? <div style={{ color: 'var(--text-secondary)', fontSize: '0.78rem', padding: '0.25rem 0.75rem 0.75rem' }}>Start a studio from a loaded model in Model Center.</div>
           : Object.entries(chatSessions.reduce((groups, chat) => {
-              const modality = chat.modality ?? 'text';
-              const modelKey = `${modality}:${chat.modelId}`;
-              groups[modality] ??= {};
-              groups[modality][modelKey] ??= { name: chat.modelName, modelId: chat.modelId, chats: [] };
-              groups[modality][modelKey].chats.push(chat);
+              const modelKey = chat.studioKey || canonicalStudioKey(chat.modelPath, chat.modelName);
+              if (!modelKey) return groups;
+              groups[modelKey] ??= { name: chat.modelName, modelId: chat.modelId, chats: [] };
+              groups[modelKey].chats.push(chat);
               return groups;
-            }, {})).map(([modality, models]) => {
-              const modalityKey = `modality:${modality}`;
-              const modalityOpen = expandedStudioGroups[modalityKey] ?? true;
-              return <div key={modalityKey}>
-                <button className="nav-btn" onClick={() => setExpandedStudioGroups(current => ({ ...current, [modalityKey]: !modalityOpen }))}>
-                  {modalityOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />} {modality.toUpperCase()}
-                </button>
-                {modalityOpen && Object.entries(models).map(([modelKey, model]) => {
-                  const modelOpen = expandedStudioGroups[modelKey] ?? true;
-                  return <div key={modelKey} style={{ paddingLeft: '0.55rem' }}>
-                    <button className="nav-btn" onClick={() => setExpandedStudioGroups(current => ({ ...current, [modelKey]: !modelOpen }))}>
-                      {modelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} {model.name}
+            }, {})).map(([modelKey, model]) => {
+              const modelOpen = !(collapsedStudios[modelKey] ?? false);
+              const isPendingDeleteModel = pendingDeleteModelKey === modelKey;
+              const modelSessionIds = model.chats.map(c => c.id);
+              const handleDeleteModelClick = (e) => {
+                e.stopPropagation();
+                if (isPendingDeleteModel) {
+                  setPendingRemoveIds(ids => {
+                    const additions = modelSessionIds.filter(id => !ids.includes(id));
+                    return additions.length ? [...ids, ...additions] : ids;
+                  });
+                  setTimeout(() => {
+                    setChatSessions(current => current.filter(item => {
+                      const k = item.studioKey || canonicalStudioKey(item.modelPath, item.modelName);
+                      return k !== modelKey;
+                    }));
+                    setPendingRemoveIds(ids => ids.filter(id => !modelSessionIds.includes(id)));
+                    if (activeChatId && modelSessionIds.includes(activeChatId)) {
+                      setActiveChatId(null);
+                      setMessages([]);
+                    }
+                    setPendingDeleteModelKey(null);
+                  }, 350);
+                } else {
+                  setPendingDeleteModelKey(modelKey);
+                }
+              };
+              return <div key={modelKey} style={{ paddingLeft: '0.55rem' }}>
+                <div className={`studio-group-row ${isPendingDeleteModel ? 'pending-delete' : ''}`}>
+                  <button className="nav-btn studio-group-toggle" onClick={() => setCollapsedStudios(current => ({ ...current, [modelKey]: !(current[modelKey] ?? false) }))}>
+                    {modelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} {model.name}
+                  </button>
+                  <div className="studio-group-actions">
+                    <button type="button" className={`chat-session-action delete ${isPendingDeleteModel ? 'confirm' : ''}`} onClick={handleDeleteModelClick} title={isPendingDeleteModel ? 'Click again to confirm delete all studios' : 'Delete all studios for this model'} aria-label="Delete all studios for this model">
+                      {isPendingDeleteModel ? <span className="confirm-label">Delete?</span> : <X size={13} />}
                     </button>
-                    {modelOpen && model.chats.map(chat => <button key={chat.id} className={`nav-btn ${activeChatId === chat.id ? 'active' : ''}`} style={{ paddingLeft: '2.1rem', fontSize: '0.8rem' }} onClick={() => { setSelectedModelId(chat.modelId); setActiveChatId(chat.id); setMessages(chat.messages ?? []); openModelStudio(chat); }} title={chat.title}>
-                      <MessageSquare size={14} /> {chat.title}
-                    </button>)}
+                  </div>
+                </div>
+                {modelOpen && model.chats.map(chat => {
+                  const isEditing = editingSessionId === chat.id;
+                  const isPendingDelete = pendingDeleteId === chat.id;
+                  const commitRename = () => {
+                    const trimmed = editValue.trim();
+                    const targetId = editingSessionId;
+                    setEditingSessionId(null);
+                    setEditValue('');
+                    if (!trimmed || !targetId) return;
+                    setChatSessions(current => current.map(item => item.id === targetId && trimmed !== item.title ? { ...item, title: trimmed } : item));
+                  };
+                  const cancelRename = () => {
+                    setEditingSessionId(null);
+                    setEditValue('');
+                  };
+                  const startRename = (e) => {
+                    e.stopPropagation();
+                    setEditValue(chat.title);
+                    setEditingSessionId(chat.id);
+                  };
+                  const handleDeleteClick = (e) => {
+                    e.stopPropagation();
+                    if (isPendingDelete) {
+                      // Mark the row for fade-out, then drop it from state
+                      // once the CSS transition has played.
+                      setPendingRemoveIds(ids => ids.includes(chat.id) ? ids : [...ids, chat.id]);
+                      setTimeout(() => {
+                        setChatSessions(current => current.filter(item => item.id !== chat.id));
+                        setPendingRemoveIds(ids => ids.filter(id => id !== chat.id));
+                        if (activeChatId === chat.id) {
+                          setActiveChatId(null);
+                          setMessages([]);
+                        }
+                        setPendingDeleteId(null);
+                      }, 350);
+                    } else {
+                      setPendingDeleteId(chat.id);
+                    }
+                  };
+                  return <div key={chat.id} className={`nav-btn chat-session-row ${activeChatId === chat.id ? 'active' : ''} ${isEditing ? 'editing' : ''} ${isPendingDelete ? 'pending-delete' : ''} ${pendingRemoveIds.includes(chat.id) ? 'fading-out' : ''}`} style={{ paddingLeft: '2.1rem', fontSize: '0.8rem' }}>
+                    <button type="button" className="chat-session-main" onClick={() => {
+                      // Backend model_ids include a load timestamp (mdl-{ts}-{port}),
+                      // so a re-loaded model has a fresh id even when the file
+                      // is the same. Resolve chat.modelId against the current
+                      // daemon registry (by id, then by stable modelPath) so
+                      // the UI shows the actually-loaded model instead of "No
+                      // Model Loaded" for studios created under a previous
+                      // daemon instance. Falls back to the stored id so
+                      // messages still route through the daemon's port-50052
+                      // fallback when nothing matches.
+                      const liveMatch = loadedModels.find(loaded => loaded.model_id === chat.modelId)
+                        ?? (chat.modelPath ? loadedModels.find(loaded => loaded.model_path === chat.modelPath) : null)
+                        ?? null;
+                      setSelectedModelId(liveMatch?.model_id ?? chat.modelId);
+                      setActiveChatId(chat.id);
+                      setMessages(chat.messages ?? []);
+                      openModelStudio(chat);
+                    }} title={chat.title}>
+                      <MessageSquare size={14} />
+                      {isEditing ? (
+                        <input
+                          type="text"
+                          className="chat-session-edit-input"
+                          value={editValue}
+                          onChange={e => setEditValue(e.target.value)}
+                          onClick={e => e.stopPropagation()}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+                            else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                          }}
+                          onBlur={commitRename}
+                          autoFocus
+                          onFocus={e => e.target.select()}
+                          aria-label="Rename studio"
+                        />
+                      ) : (
+                        <span className="chat-session-title">{displayedTitles[chat.id] ?? chat.title}</span>
+                      )}
+                    </button>
+                    <div className="chat-session-actions">
+                      <button type="button" className="chat-session-action" onClick={startRename} title="Rename studio" aria-label="Rename studio">
+                        <Pencil size={13} />
+                      </button>
+                      <button type="button" className={`chat-session-action delete ${isPendingDelete ? 'confirm' : ''}`} onClick={handleDeleteClick} title={isPendingDelete ? 'Click again to confirm delete' : 'Delete studio'} aria-label="Delete studio">
+                        {isPendingDelete ? <span className="confirm-label">Delete?</span> : <X size={13} />}
+                      </button>
+                    </div>
                   </div>;
                 })}
               </div>;
@@ -828,11 +1081,15 @@ export default function App() {
                                 <div className="answer-content">
                                   {answer ? (
                                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown>
-                                  ) : (
+                                  ) : msg.loading ? (
+                                    <em style={{ opacity: 0.6, fontSize: '0.85rem', color: '#94a3b8' }}>
+                                      Thinking…
+                                    </em>
+                                  ) : msg.truncated ? (
                                     <em style={{ opacity: 0.6, fontSize: '0.85rem', color: '#94a3b8' }}>
                                       [Model reached output token limit during reasoning — try re-prompting]
                                     </em>
-                                  )}
+                                  ) : null}
                                 </div>
                               </>
                             );
@@ -905,57 +1162,19 @@ export default function App() {
                       <div key={model.path} style={{ borderBottom: '1px solid var(--border-color)', padding: '0.85rem 0' }}>
                         <strong>{model.name}</strong>
                         <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{model.modality.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</div>
-                        <button className="btn-load-model" onClick={() => openConfigPanel({ name: model.name, path: model.path, max_context_size: model.max_context_size })}>
-                          <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
-                        </button>{' '}
-                        {isLoaded ? <button className="btn-unload-model" onClick={() => handleUnloadModel(loadedEntry.model_id)} disabled={unloadingModelId === loadedEntry.model_id}><Power size={14} /> Eject</button>
-                        : <button className="btn-load-model" onClick={() => handleLoadModel({ model_path: model.path, gpu_layers: 99, context_size: Math.min(4096, model.max_context_size ?? 4096) })} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
-                        {isLoaded && <button className="btn-load-model" style={{ marginLeft: '0.4rem' }} onClick={() => startStudio(loadedEntry, model)} title="Start studio"><Play size={14} /></button>}
+                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.25rem' }}>
+                          <button className="btn-load-model" onClick={() => openConfigPanel({ name: model.name, path: model.path, max_context_size: model.max_context_size })}>
+                            <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
+                          </button>
+                          {isLoaded ? <button className="btn-unload-model" onClick={() => handleUnloadModel(loadedEntry.model_id)} disabled={unloadingModelId === loadedEntry.model_id}><Power size={14} /> Eject</button>
+                          : <button className="btn-load-model" onClick={() => handleLoadModel({ model_path: model.path, gpu_layers: 99, context_size: Math.min(4096, model.max_context_size ?? 4096) })} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
+                          {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, model)} title="Start studio"><Play size={14} /></button>}
+                        </div>
                       </div>
                     );
                   })}
                   {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No GGUF models found in AIATM’s models folder.</p>}
                 </div>
-                {configTarget && <div className="card">
-                  <h3 style={{ marginBottom: '1rem' }}>Model settings</h3>
-                  <div className="form-group">
-                    <label>GGUF model path</label>
-                    <input value={configTarget?.model_path || ''} onChange={e => setConfigTarget(current => ({ ...current, model_path: e.target.value }))} />
-                  </div>
-                  <div className="slider-header"><label className="section-label">GPU layers</label><span className="badge-value">{configTarget?.gpu_layers ?? 99}</span></div>
-                  <input className="control-slider" type="range" min="0" max="99" value={configTarget?.gpu_layers ?? 99} onChange={e => setConfigTarget(current => ({ ...current, gpu_layers: Number(e.target.value) }))} />
-                  <div className="slider-header" style={{ marginTop: '1rem' }}><label className="section-label">Context window</label><span className="badge-value">{(configTarget?.context_size ?? 4096).toLocaleString()} / {configTarget?.max_context_size ? configTarget.max_context_size.toLocaleString() : '?'}</span></div>
-                  {configTarget?.max_context_size ? <>
-                    <input className="control-slider" type="range" min="512" max={configTarget.max_context_size} step="512" value={Math.min(configTarget.context_size ?? 4096, configTarget.max_context_size)} onChange={e => setConfigTarget(current => ({ ...current, context_size: Number(e.target.value) }))} />
-                    <div className="slider-hint">Maximum read from this GGUF model’s metadata.</div>
-                  </> : <div className="slider-hint">Maximum context is not present in this model’s metadata.</div>}
-                  <div className="slider-header"><label className="section-label">Temperature</label><span className="badge-value">{configTarget?.temperature ?? 0.7}</span></div>
-                  <input className="control-slider" type="range" min="0" max="1.5" step="0.05" value={configTarget?.temperature ?? 0.7} onChange={e => setConfigTarget(current => ({ ...current, temperature: Number(e.target.value) }))} />
-                  <div className="slider-header" style={{ marginTop: '0.75rem' }}><label className="section-label">Top-P</label><span className="badge-value">{configTarget?.top_p ?? 0.9}</span></div>
-                  <input className="control-slider" type="range" min="0.1" max="1" step="0.05" value={configTarget?.top_p ?? 0.9} onChange={e => setConfigTarget(current => ({ ...current, top_p: Number(e.target.value) }))} />
-                  <div className="vram-preview-card" style={{ marginTop: '1rem' }}><div className="preview-title"><Cpu size={13} /> Estimated VRAM</div><strong>{((modelFitPreview?.total_required_vram_bytes || 0) / 1e9).toFixed(2)} GB</strong></div>
-                  <button className="btn-load-model" style={{ margin: '1rem 0' }} onClick={handleLoadModel} disabled={isLoadingModel}><Zap size={15} /> {isLoadingModel ? 'Loading...' : 'Load configured model'}</button>
-                  <h3 style={{ marginBottom: '1rem' }}>Loaded models ({loadedModels.length})</h3>
-                  {loadedModels.length === 0 ? <p style={{ color: 'var(--text-secondary)' }}>No models are loaded.</p> : loadedModels.map(model => (
-                    <div key={model.model_id} style={{ borderBottom: '1px solid var(--border-color)', padding: '0.85rem 0' }}>
-                      <strong>{model.model_path?.split('\\').pop() || model.model_id}</strong>
-                      <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>
-                        {model.gpu_layers ?? 0} GPU layers · {model.context_size ?? 0} context
-                      </div>
-                      <button className="btn-load-model" onClick={() => setSelectedModelId(model.model_id)} disabled={selectedModelId === model.model_id}>
-                        {selectedModelId === model.model_id ? 'Selected for chat' : 'Use for chat'}
-                      </button>{' '}
-                      <button className="btn-unload-model" onClick={() => handleUnloadModel(model.model_id)} disabled={unloadingModelId === model.model_id}>
-                        <Power size={14} /> Eject
-                      </button>
-                    </div>
-                  ))}
-                  {false && <div style={{ marginTop: '1rem' }}>
-                    <button className="btn-load-model" onClick={handleLoadModel} disabled={isLoadingModel}>
-                      <Zap size={15} /> {isLoadingModel ? 'Loading…' : `Load ${configTarget.name || configTarget.model_path?.split('\\').pop()}`}
-                    </button>
-                  </div>}
-                </div>}
               </div>
             </div>
           )}
@@ -1095,6 +1314,72 @@ export default function App() {
 
         </main>
       </div>
+
+      {/* Configure Model Sidebar (left overlay) */}
+      {configTarget && (
+        <>
+          <div className="config-sidebar-backdrop" onClick={() => setConfigTarget(null)} />
+          <aside className="config-sidebar">
+            <div className="config-sidebar-header">
+              <button className="config-sidebar-close" onClick={() => setConfigTarget(null)} title="Close">
+                <X size={16} />
+              </button>
+              <div className="config-sidebar-title">
+                <Settings size={16} /> {configTarget.name || 'Model'} settings
+              </div>
+            </div>
+            <div className="config-sidebar-body">
+              <div className="sidebar-section">
+                <label className="section-label">GGUF model path</label>
+                <input className="control-input" value={configTarget?.model_path || ''} onChange={e => setConfigTarget(current => ({ ...current, model_path: e.target.value }))} />
+              </div>
+              <div className="sidebar-section">
+                <div className="slider-header"><label className="section-label">GPU layers</label><span className="badge-value">{configTarget?.gpu_layers ?? 99}</span></div>
+                <input className="control-slider" type="range" min="0" max="99" value={configTarget?.gpu_layers ?? 99} onChange={e => setConfigTarget(current => ({ ...current, gpu_layers: Number(e.target.value) }))} />
+              </div>
+              <div className="sidebar-section">
+                <div className="slider-header"><label className="section-label">Context window</label><span className="badge-value">{(configTarget?.context_size ?? 4096).toLocaleString()} / {configTarget?.max_context_size ? configTarget.max_context_size.toLocaleString() : '?'}</span></div>
+                {configTarget?.max_context_size ? <>
+                  <input className="control-slider" type="range" min="512" max={configTarget.max_context_size} step="512" value={Math.min(configTarget.context_size ?? 4096, configTarget.max_context_size)} onChange={e => setConfigTarget(current => ({ ...current, context_size: Number(e.target.value) }))} />
+                  <div className="slider-hint">Maximum read from this GGUF model’s metadata.</div>
+                </> : <div className="slider-hint">Maximum context is not present in this model’s metadata.</div>}
+              </div>
+              <div className="sidebar-section">
+                <div className="slider-header"><label className="section-label">Temperature</label><span className="badge-value">{configTarget?.temperature ?? 0.7}</span></div>
+                <input className="control-slider" type="range" min="0" max="1.5" step="0.05" value={configTarget?.temperature ?? 0.7} onChange={e => setConfigTarget(current => ({ ...current, temperature: Number(e.target.value) }))} />
+              </div>
+              <div className="sidebar-section">
+                <div className="slider-header"><label className="section-label">Top-P</label><span className="badge-value">{configTarget?.top_p ?? 0.9}</span></div>
+                <input className="control-slider" type="range" min="0.1" max="1" step="0.05" value={configTarget?.top_p ?? 0.9} onChange={e => setConfigTarget(current => ({ ...current, top_p: Number(e.target.value) }))} />
+              </div>
+              <div className="vram-preview-card">
+                <div className="preview-title"><Cpu size={13} /> Estimated VRAM</div>
+                <strong>{((modelFitPreview?.total_required_vram_bytes || 0) / 1e9).toFixed(2)} GB</strong>
+              </div>
+              <button className="btn-load-model config-sidebar-load" onClick={() => handleLoadModel({ model_path: configTarget?.model_path, gpu_layers: configTarget?.gpu_layers ?? 99, context_size: configTarget?.context_size ?? 4096 })} disabled={isLoadingModel}>
+                <Zap size={15} /> {isLoadingModel ? 'Loading...' : 'Load configured model'}
+              </button>
+              <div className="config-sidebar-section-title">Loaded models ({loadedModels.length})</div>
+              {loadedModels.length === 0 ? <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>No models are loaded.</p> : loadedModels.map(model => (
+                <div key={model.model_id} className="config-sidebar-loaded-row">
+                  <strong>{model.model_path?.split('\\').pop() || model.model_id}</strong>
+                  <div className="config-sidebar-loaded-meta">
+                    {model.gpu_layers ?? 0} GPU layers · {model.context_size ?? 0} context
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                    <button className="btn-load-model" onClick={() => setSelectedModelId(model.model_id)} disabled={selectedModelId === model.model_id}>
+                      {selectedModelId === model.model_id ? 'Selected for chat' : 'Use for chat'}
+                    </button>
+                    <button className="btn-unload-model" onClick={() => handleUnloadModel(model.model_id)} disabled={unloadingModelId === model.model_id}>
+                      <Power size={14} /> Eject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </aside>
+        </>
+      )}
     </div>
   );
 }

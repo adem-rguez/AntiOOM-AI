@@ -13,6 +13,7 @@ use crate::registry::BackendRegistry;
 use crate::profiler::{FitEstimationRequest, FitEstimationResult, HardwareProfiler, SystemHardwareInfo};
 use crate::session::{ActiveSession, SessionManager};
 use backend_trait::{ChatMessage, InferenceRequest, Modality, SamplingParams};
+use llama_backend::process_tracker::ChildRegistry;
 use moe_cache::MoeExpertCache;
 use pool_protocol::{ClusterPoolManager, PeerNode};
 
@@ -50,6 +51,11 @@ pub struct AppState {
     pub next_port: Arc<AtomicU16>,
     /// Kept for backwards compat with existing code that still references active_model
     pub active_model: Arc<tokio::sync::Mutex<LoadedModelStatus>>,
+    /// Tracks every llama-server.exe spawned by the daemon so it can be
+    /// terminated on shutdown or on targeted unload. Keyed by model_id.
+    pub children: Arc<ChildRegistry>,
+    /// Broadcast channel for graceful shutdown. Sent by `/shutdown` endpoint.
+    pub shutdown_signal: tokio::sync::broadcast::Sender<()>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +75,32 @@ fn message_text(content: &serde_json::Value) -> String {
         _ => String::new(),
     }
 }
+/// Decode and return image bytes from any `image_url` data URL found in the
+/// OpenAI-style chat-completion payload's messages. Returns the first image.
+fn extract_image_input(messages: &[ChatCompletionMessage]) -> Option<Vec<u8>> {
+    use base64::Engine;
+    for msg in messages {
+        if let serde_json::Value::Array(parts) = &msg.content {
+            for part in parts {
+                let url = part.get("image_url")
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str());
+                if let Some(url) = url {
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        if let Some(comma_idx) = rest.find(',') {
+                            let b64 = &rest[comma_idx + 1..];
+                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                return Some(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -142,6 +174,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(dashboard_landing))
         .route("/dashboard", get(dashboard_landing))
         .route("/health", get(health_check))
+        .route("/shutdown", get(shutdown_handler))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/completions/stream", post(stream_chat_completions))
@@ -163,6 +196,11 @@ pub fn create_router(state: AppState) -> Router {
 
 async fn health_check() -> &'static str {
     "Local Inference Daemon operational"
+}
+
+async fn shutdown_handler(State(state): State<AppState>) -> &'static str {
+    let _ = state.shutdown_signal.send(());
+    "Shutdown signal sent"
 }
 
 #[derive(Serialize)]
@@ -1087,12 +1125,32 @@ async fn stream_chat_completions(
         }
     }
 
-    // Build messages with system prompt
+    // Build messages with system prompt. If any message carries an image_url,
+    // forward the multimodal content array unchanged to llama-server (which
+    // needs --mmproj loaded to actually accept the image part).
+    let has_image = extract_image_input(&payload.inner.messages).is_some();
+    let last_user_idx = if has_image {
+        payload.inner.messages.iter().rposition(|m| m.role == "user")
+    } else {
+        None
+    };
     let mut chat_messages: Vec<serde_json::Value> = vec![
         serde_json::json!({ "role": "system", "content": "You are a helpful, knowledgeable AI assistant." })
     ];
-    for msg in &payload.inner.messages {
-        chat_messages.push(serde_json::json!({ "role": msg.role, "content": msg.content }));
+    for (i, msg) in payload.inner.messages.iter().enumerate() {
+        if Some(i) == last_user_idx && has_image {
+            let content = match &msg.content {
+                serde_json::Value::Array(parts) => parts.clone(),
+                serde_json::Value::String(s) => vec![serde_json::json!({"type":"text","text":s})],
+                _ => vec![],
+            };
+            chat_messages.push(serde_json::json!({
+                "role": msg.role,
+                "content": content
+            }));
+        } else {
+            chat_messages.push(serde_json::json!({ "role": msg.role, "content": msg.content }));
+        }
     }
 
     let req_body = serde_json::json!({
@@ -1190,10 +1248,10 @@ async fn chat_completions(
             top_p: payload.top_p.unwrap_or(0.9),
             top_k: 40,
             max_tokens: payload.max_tokens.unwrap_or(4096),
-            stop_sequences: vec!["<|im_end|>".to_string(), "<|endoftext|>".to_string(), "</s>".to_string()],
+            stop_sequences: vec!["".to_string(), "".to_string(), "</s>".to_string()],
         },
         modality: Modality::Text,
-        image_input: None,
+        image_input: extract_image_input(&payload.messages),
     };
 
     {
@@ -1692,7 +1750,11 @@ async fn load_model(
             .arg("--host").arg("127.0.0.1")
             .spawn();
         match child {
-            Ok(_c) => {
+            Ok(c) => {
+                // Hand ownership of the Child to the registry so shutdown /
+                // explicit unload can terminate it. (Previously `_c` was
+                // discarded here, leaking the spawned process.)
+                state.children.register(model_id.clone(), c);
                 // Give the server time to start
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
@@ -1745,10 +1807,16 @@ async fn unload_model(
             models.remove(mid)
         };
         if let Some(e) = entry {
-            // Kill whichever llama-server is listening on that port
+            // `take` removes the entry AND terminates the tracked child via
+            // Child::kill() (see ChildRegistry::take). No shell-out, no PID
+            // guessing — the Child handle is the source of truth.
+            let _ = state.children.take(mid);
+            // Belt-and-suspenders: kill whichever llama-server is listening on
+            // that port in case the tracker is out of sync (e.g. process
+            // adopted from a previous run).
             let _ = std::process::Command::new("powershell")
                 .args(["-Command", &format!(
-                    "Stop-Process -Id (Get-NetTCPConnection -LocalPort {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess) -Force -ErrorAction SilentlyContinue",
+                    "$pid = (Get-NetTCPConnection -LocalPort {} -ErrorAction SilentlyContinue).OwningProcess; if ($pid) {{ Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }}",
                     e.port
                 )])
                 .spawn();

@@ -241,6 +241,7 @@ dependencies = [
  "async-trait",
  "axum",
  "backend-trait",
+ "base64",
  "bytes",
  "futures",
  "llama-backend",
@@ -823,6 +824,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "backend-trait",
+ "base64",
  "bytes",
  "futures",
  "reqwest",
@@ -831,6 +833,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
