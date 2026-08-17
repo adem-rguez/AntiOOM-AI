@@ -199,6 +199,9 @@ async fn health_check() -> &'static str {
 }
 
 async fn shutdown_handler(State(state): State<AppState>) -> &'static str {
+    tracing::info!("Shutdown requested — killing all llama-server children before exit");
+    state.children.kill_all(std::time::Duration::from_secs(5));
+    state.loaded_models.lock().await.clear();
     let _ = state.shutdown_signal.send(());
     "Shutdown signal sent"
 }

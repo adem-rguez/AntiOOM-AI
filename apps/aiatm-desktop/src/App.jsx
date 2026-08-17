@@ -510,9 +510,15 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const sysInfoInFlight = useRef(false);
   const fetchSystemInfo = async () => {
+    if (sysInfoInFlight.current) return;
+    sysInfoInFlight.current = true;
     try {
-      const res = await fetch('http://127.0.0.1:8080/v1/system/info');
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch('http://127.0.0.1:8080/v1/system/info', { signal: controller.signal });
+      clearTimeout(timeout);
       const data = await res.json();
       if (data) {
         setSysInfo({
@@ -523,14 +529,17 @@ export default function App() {
           free_vram_gb: (data.free_vram_bytes / (1024 * 1024 * 1024)).toFixed(1)
         });
       }
-    } catch {}
+    } catch {} finally {
+      sysInfoInFlight.current = false;
+    }
   };
 
-  // Poll system hardware info periodically (every 2.5s)
   useEffect(() => {
     fetchSystemInfo();
-    const interval = setInterval(fetchSystemInfo, 2500);
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchSystemInfo, 3000);
+    const onVisibility = () => { if (document.visibilityState === 'visible') fetchSystemInfo(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => { clearInterval(interval); document.removeEventListener('visibilitychange', onVisibility); };
   }, []);
 
   const handleSendMessage = async () => {
