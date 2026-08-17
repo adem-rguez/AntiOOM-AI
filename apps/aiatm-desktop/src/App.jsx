@@ -3,7 +3,8 @@ import {
   MessageSquare, Sparkles, Volume2, Video,
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
-  CheckCircle2, XCircle, PackagePlus, Box, Paperclip, X, Pencil
+  CheckCircle2, XCircle, PackagePlus, Box, Paperclip, X, Pencil,
+  Search, Download, Globe, Loader, Check, Heart
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -322,6 +323,122 @@ export default function App() {
   });
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [modelPickerSearch, setModelPickerSearch] = useState('');
+  const [modelPickerTab, setModelPickerTab] = useState('local');
+  const [hfSearchQuery, setHfSearchQuery] = useState('');
+  const [hfSearchResults, setHfSearchResults] = useState([]);
+  const [hfSearchLoading, setHfSearchLoading] = useState(false);
+  const [hfSearchError, setHfSearchError] = useState(false);
+  const [hfSort, setHfSort] = useState('trendingScore');
+  const [hfFilters, setHfFilters] = useState([]);
+  const [hfExpandedRepo, setHfExpandedRepo] = useState(null);
+  const [hfRepoFiles, setHfRepoFiles] = useState([]);
+  const [hfRepoFilesLoading, setHfRepoFilesLoading] = useState(false);
+  const [hfDownloads, setHfDownloads] = useState({});
+
+  const closeModelPicker = () => {
+    setShowModelPicker(false);
+    setModelPickerSearch('');
+    setModelPickerTab('local');
+    setHfSearchQuery('');
+    setHfSearchResults([]);
+    setHfSearchLoading(false);
+    setHfSearchError(false);
+    setHfExpandedRepo(null);
+    setHfRepoFiles([]);
+    setHfDownloads({});
+  };
+
+  const formatCount = (n) => {
+    if (n == null) return '0';
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return `${n}`;
+  };
+
+  const formatFileSize = (bytes) => {
+    if (bytes == null) return '';
+    const gb = bytes / 1e9;
+    if (gb >= 1) return `${gb.toFixed(2)} GB`;
+    return `${(bytes / 1e6).toFixed(0)} MB`;
+  };
+
+  const toggleHfFilter = (tag) => {
+    setHfFilters(current => current.includes(tag) ? current.filter(t => t !== tag) : [...current, tag]);
+  };
+
+  const runHfSearch = useCallback((query, sort, filters) => {
+    if (!query.trim()) {
+      setHfSearchResults([]);
+      setHfSearchLoading(false);
+      setHfSearchError(false);
+      return;
+    }
+    setHfSearchLoading(true);
+    setHfSearchError(false);
+    const params = new URLSearchParams({ q: query, sort });
+    if (filters.length > 0) params.set('filter', filters.join(','));
+    fetch(`http://127.0.0.1:8080/v1/model/hf-search?${params.toString()}`)
+      .then(res => res.ok ? res.json() : Promise.reject(new Error('search failed')))
+      .then(results => setHfSearchResults(Array.isArray(results) ? results : []))
+      .catch(() => {
+        setHfSearchResults([]);
+        setHfSearchError(true);
+      })
+      .finally(() => setHfSearchLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (modelPickerTab !== 'discover') return;
+    const handle = setTimeout(() => runHfSearch(hfSearchQuery, hfSort, hfFilters), 500);
+    return () => clearTimeout(handle);
+  }, [hfSearchQuery, hfSort, hfFilters, modelPickerTab, runHfSearch]);
+
+  const expandHfRepo = (repoId) => {
+    if (hfExpandedRepo === repoId) {
+      setHfExpandedRepo(null);
+      setHfRepoFiles([]);
+      return;
+    }
+    setHfExpandedRepo(repoId);
+    setHfRepoFiles([]);
+    setHfRepoFilesLoading(true);
+    fetch(`http://127.0.0.1:8080/v1/model/hf-files?repo=${encodeURIComponent(repoId)}`)
+      .then(res => res.ok ? res.json() : [])
+      .then(files => setHfRepoFiles(Array.isArray(files) ? files : []))
+      .catch(() => setHfRepoFiles([]))
+      .finally(() => setHfRepoFilesLoading(false));
+  };
+
+  const startHfDownload = (repoId, filename) => {
+    setHfDownloads(current => ({ ...current, [filename]: { status: 'downloading', downloaded_bytes: 0, total_bytes: 0 } }));
+    fetch('http://127.0.0.1:8080/v1/model/hf-download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo: repoId, filename }),
+    }).catch(() => {
+      setHfDownloads(current => ({ ...current, [filename]: { ...current[filename], status: 'error' } }));
+    });
+  };
+
+  useEffect(() => {
+    const activeDownloads = Object.entries(hfDownloads).filter(([, info]) => info.status === 'downloading');
+    if (activeDownloads.length === 0) return;
+    const interval = setInterval(() => {
+      fetch('http://127.0.0.1:8080/v1/model/hf-download/status')
+        .then(res => res.ok ? res.json() : {})
+        .then(status => {
+          setHfDownloads(current => {
+            const next = { ...current };
+            for (const [filename, info] of Object.entries(status)) {
+              if (next[filename]) next[filename] = { ...next[filename], ...info };
+            }
+            return next;
+          });
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [hfDownloads]);
 
   useEffect(() => {
     localStorage.setItem('antioom-model-cards', JSON.stringify(modelCards));
@@ -455,11 +572,12 @@ export default function App() {
   const selectedCatalogModel = detectedModels.find(model => model.path === selectedModel?.model_path);
   const acceptsImageInput = selectedCatalogModel?.image_input_available === true;
   const openModelStudio = (model) => {
-    const studio = model.modality === 'vision' ? 'chat' : model.modality;
+    const modalityMap = { vision: 'chat', tts: 'audio', text: 'chat' };
+    const studio = modalityMap[model.modality] ?? model.modality;
     setActiveTab(['chat', 'image', 'audio', 'video'].includes(studio) ? studio : 'chat');
   };
   const startStudio = (loadedEntry, catalogModel) => {
-    const modality = catalogModel?.modality ?? 'text';
+    const modality = catalogModel?.modality ?? loadedEntry?.modality ?? 'text';
     const modelName = catalogModel?.name ?? loadedEntry.model_path?.split('\\').pop() ?? 'Local model';
     const chatId = `chat-${Date.now()}`;
     const initialMessages = [{ id: 'welcome', role: 'assistant', content: `Ready to use ${modelName}.`, telemetry: null }];
@@ -1229,51 +1347,192 @@ export default function App() {
           )}
 
           {showModelPicker && (
-            <div className="modal-backdrop" onClick={() => setShowModelPicker(false)}>
-              <div className="modal-container" onClick={e => e.stopPropagation()}>
+            <div className="modal-backdrop" onClick={closeModelPicker}>
+              <div className="modal-container modal-container-wide" onClick={e => e.stopPropagation()}>
                 <div className="modal-header">
                   <h3>Add a model</h3>
-                  <button className="config-sidebar-close" onClick={() => setShowModelPicker(false)} title="Close">
+                  <button className="config-sidebar-close" onClick={closeModelPicker} title="Close">
                     <X size={16} />
                   </button>
                 </div>
+                <div className="modal-tabs">
+                  <button className={`modal-tab ${modelPickerTab === 'local' ? 'active' : ''}`} onClick={() => setModelPickerTab('local')}>
+                    <Folder size={14} /> My Models
+                  </button>
+                  <button className={`modal-tab ${modelPickerTab === 'discover' ? 'active' : ''}`} onClick={() => setModelPickerTab('discover')}>
+                    <Globe size={14} /> Discover
+                  </button>
+                </div>
                 <div className="modal-body">
-                  <input
-                    type="text"
-                    className="control-input"
-                    placeholder="Search models..."
-                    value={modelPickerSearch}
-                    onChange={e => setModelPickerSearch(e.target.value)}
-                    autoFocus
-                  />
-                  <div className="modal-list">
-                    {detectedModels
-                      .filter(model => model.name.toLowerCase().includes(modelPickerSearch.toLowerCase()))
-                      .map(model => (
-                        <button
-                          key={model.path}
-                          className="modal-list-item"
-                          onClick={() => {
-                            setModelCards(current => [...current, {
-                              id: crypto.randomUUID(),
-                              modelPath: model.path,
-                              name: model.name,
-                              modality: model.modality,
-                              size_bytes: model.size_bytes,
-                              max_context_size: model.max_context_size ?? null,
-                              image_input_available: model.image_input_available === true,
-                              mmproj_path: model.mmproj_path || null,
-                            }]);
-                            setShowModelPicker(false);
-                            setModelPickerSearch('');
-                          }}
-                        >
-                          <strong>{model.name}</strong>
-                          <span className="modal-list-item-meta">{model.modality?.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</span>
-                        </button>
-                      ))}
-                    {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in AIATM's models folder.</p>}
-                  </div>
+                  {modelPickerTab === 'local' && (
+                    <>
+                      <input
+                        type="text"
+                        className="control-input"
+                        placeholder="Search models..."
+                        value={modelPickerSearch}
+                        onChange={e => setModelPickerSearch(e.target.value)}
+                        autoFocus
+                      />
+                      <div className="modal-list">
+                        {detectedModels
+                          .filter(model => model.name.toLowerCase().includes(modelPickerSearch.toLowerCase()))
+                          .map(model => (
+                            <button
+                              key={model.path}
+                              className="modal-list-item"
+                              onClick={() => {
+                                setModelCards(current => [...current, {
+                                  id: crypto.randomUUID(),
+                                  modelPath: model.path,
+                                  name: model.name,
+                                  modality: model.modality,
+                                  size_bytes: model.size_bytes,
+                                  max_context_size: model.max_context_size ?? null,
+                                  image_input_available: model.image_input_available === true,
+                                  mmproj_path: model.mmproj_path || null,
+                                }]);
+                                closeModelPicker();
+                              }}
+                            >
+                              <strong>{model.name}</strong>
+                              <span className="modal-list-item-meta">{model.modality?.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</span>
+                            </button>
+                          ))}
+                        {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in AIATM's models folder.</p>}
+                      </div>
+                    </>
+                  )}
+
+                  {modelPickerTab === 'discover' && (
+                    <>
+                      <div className="hf-search-bar">
+                        <input
+                          type="text"
+                          className="control-input"
+                          placeholder="Search Hugging Face for GGUF models..."
+                          value={hfSearchQuery}
+                          onChange={e => setHfSearchQuery(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') runHfSearch(hfSearchQuery, hfSort, hfFilters); }}
+                          autoFocus
+                        />
+                        <select className="control-select hf-sort-select" value={hfSort} onChange={e => setHfSort(e.target.value)}>
+                          <option value="trendingScore">Trending</option>
+                          <option value="downloads">Most Downloads</option>
+                          <option value="likes">Most Likes</option>
+                        </select>
+                      </div>
+                      <div className="hf-filter-chips">
+                        {['text-generation', 'text-generation-inference', 'text2text-generation'].map(tag => (
+                          <button
+                            key={tag}
+                            className={`hf-filter-chip ${hfFilters.includes(tag) ? 'active' : ''}`}
+                            onClick={() => toggleHfFilter(tag)}
+                          >
+                            {tag}
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="modal-list">
+                        {hfSearchLoading && (
+                          <div className="hf-empty-state">
+                            <Loader size={22} className="spin" />
+                            <p>Searching Hugging Face...</p>
+                          </div>
+                        )}
+                        {!hfSearchLoading && hfSearchError && (
+                          <div className="hf-empty-state">
+                            <XCircle size={22} />
+                            <p>Search failed. Check your internet connection.</p>
+                          </div>
+                        )}
+                        {!hfSearchLoading && !hfSearchError && !hfSearchQuery.trim() && (
+                          <div className="hf-empty-state">
+                            <Search size={22} />
+                            <p>Search for GGUF models on Hugging Face</p>
+                          </div>
+                        )}
+                        {!hfSearchLoading && !hfSearchError && hfSearchQuery.trim() && hfSearchResults.length === 0 && (
+                          <div className="hf-empty-state">
+                            <p>No results found.</p>
+                          </div>
+                        )}
+                        {!hfSearchLoading && !hfSearchError && hfSearchResults.map(result => {
+                          const repoId = result.id || `${result.author}/${result.modelId}`;
+                          const isExpanded = hfExpandedRepo === repoId;
+                          return (
+                            <div key={repoId} className="hf-result-card">
+                              <div className="hf-result-header" onClick={() => expandHfRepo(repoId)}>
+                                <div>
+                                  <strong>{result.modelId || repoId}</strong>
+                                  <span className="modal-list-item-meta"> · {result.author}</span>
+                                </div>
+                                <div className="hf-result-stats">
+                                  <span><Download size={12} /> {formatCount(result.downloads)}</span>
+                                  <span><Heart size={12} /> {formatCount(result.likes)}</span>
+                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                </div>
+                              </div>
+                              {result.tags?.length > 0 && (
+                                <div className="hf-result-tags">
+                                  {result.tags.slice(0, 6).map(tag => (
+                                    <span key={tag} className="hf-tag-badge">{tag}</span>
+                                  ))}
+                                </div>
+                              )}
+                              {isExpanded && (
+                                <div className="hf-files-list">
+                                  {hfRepoFilesLoading && (
+                                    <div className="hf-empty-state">
+                                      <Loader size={18} className="spin" />
+                                    </div>
+                                  )}
+                                  {!hfRepoFilesLoading && hfRepoFiles.length === 0 && (
+                                    <p className="modal-list-item-meta">No GGUF files found in this repo.</p>
+                                  )}
+                                  {!hfRepoFilesLoading && hfRepoFiles.map(file => {
+                                    const download = hfDownloads[file.filename];
+                                    const progressPct = download && download.total_bytes > 0
+                                      ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
+                                      : 0;
+                                    return (
+                                      <div key={file.filename} className="hf-file-row">
+                                        <div>
+                                          <div>{file.filename}</div>
+                                          <span className="modal-list-item-meta">{formatFileSize(file.size)}</span>
+                                          {download && download.status === 'downloading' && (
+                                            <div className="hf-progress-bar">
+                                              <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                                            </div>
+                                          )}
+                                          {download && download.status === 'error' && (
+                                            <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
+                                          )}
+                                        </div>
+                                        {download && download.status === 'complete' ? (
+                                          <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
+                                        ) : (
+                                          <button
+                                            className="hf-download-btn"
+                                            disabled={download?.status === 'downloading'}
+                                            onClick={() => startHfDownload(repoId, file.filename)}
+                                          >
+                                            {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
+                                            {download?.status === 'downloading' ? 'Downloading' : 'Download'}
+                                          </button>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             </div>

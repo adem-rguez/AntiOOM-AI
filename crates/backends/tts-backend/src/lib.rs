@@ -5,14 +5,27 @@ use backend_trait::{
     InferenceStream, LoadOptions, Modality, ToolSchema, VramEstimate,
 };
 use futures::stream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
+use base64::Engine;
+
+/// Ports handed out to spawned `kokoro_tts_server.py` instances.
+static NEXT_TTS_PORT: AtomicU16 = AtomicU16::new(59100);
+
+/// How long to wait for the Python server to print "READY" on startup.
+/// Model loading (Kokoro weights + espeak init) can take a while on first run.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct TtsBackend {
     model_path: Option<PathBuf>,
     is_loaded: Arc<AtomicBool>,
     supported_modalities: Vec<Modality>,
+    process: Option<Child>,
+    port: u16,
 }
 
 impl TtsBackend {
@@ -21,7 +34,64 @@ impl TtsBackend {
             model_path: None,
             is_loaded: Arc::new(AtomicBool::new(false)),
             supported_modalities: vec![Modality::AudioTts],
+            process: None,
+            port: 0,
         }
+    }
+
+    /// Spawn `scripts/kokoro_tts_server.py` and block (on a worker thread) until
+    /// it prints "READY" on stdout or `STARTUP_TIMEOUT` elapses.
+    fn spawn_server(model_path: &Path, port: u16) -> Result<Child, String> {
+        let script_path = PathBuf::from("scripts").join("kokoro_tts_server.py");
+        if !script_path.exists() {
+            return Err(format!(
+                "Kokoro TTS server script not found at: {}",
+                script_path.display()
+            ));
+        }
+
+        let mut cmd = Command::new("python");
+        cmd.arg(&script_path)
+            .arg("--model-path")
+            .arg(model_path)
+            .arg("--port")
+            .arg(port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn kokoro_tts_server.py: {}", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture stdout of kokoro_tts_server.py".to_string())?;
+
+        let start = Instant::now();
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    return Err("kokoro_tts_server.py exited before signalling READY".to_string());
+                }
+                Ok(_) => {
+                    if line.trim() == "READY" {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Error reading kokoro_tts_server.py stdout: {}", e));
+                }
+            }
+            if start.elapsed() > STARTUP_TIMEOUT {
+                let _ = child.kill();
+                return Err("Timed out waiting for kokoro_tts_server.py to start".to_string());
+            }
+        }
+
+        Ok(child)
     }
 }
 
@@ -67,10 +137,41 @@ impl InferenceBackend for TtsBackend {
         _options: &LoadOptions,
     ) -> Result<(), BackendError> {
         if !model_path.exists() {
-            info!("TTS model path '{}' not found on disk; starting backend in simulation mode.", model_path.display());
+            warn!(
+                "TTS model path '{}' not found on disk; starting backend in simulation mode.",
+                model_path.display()
+            );
+            self.model_path = Some(model_path.to_path_buf());
+            self.is_loaded.store(true, Ordering::SeqCst);
+            return Ok(());
         }
 
         info!("Loading Kokoro TTS model: {}", model_path.display());
+
+        // Kill any previously running server before spawning a new one.
+        if let Some(mut child) = self.process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let port = NEXT_TTS_PORT.fetch_add(1, Ordering::SeqCst);
+        let model_path_owned = model_path.to_path_buf();
+
+        match tokio::task::spawn_blocking(move || Self::spawn_server(&model_path_owned, port))
+            .await
+            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
+        {
+            Ok(child) => {
+                info!("kokoro_tts_server.py ready on port {} (PID: {})", port, child.id());
+                self.process = Some(child);
+                self.port = port;
+            }
+            Err(e) => {
+                warn!("Failed to start kokoro_tts_server.py: {}. Falling back to simulation mode.", e);
+                self.process = None;
+            }
+        }
+
         self.model_path = Some(model_path.to_path_buf());
         self.is_loaded.store(true, Ordering::SeqCst);
 
@@ -81,6 +182,10 @@ impl InferenceBackend for TtsBackend {
     async fn unload_model(&mut self) -> Result<(), BackendError> {
         if self.is_loaded.load(Ordering::SeqCst) {
             info!("Unloading Kokoro TTS model from memory");
+            if let Some(mut child) = self.process.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             self.model_path = None;
             self.is_loaded.store(false, Ordering::SeqCst);
         }
@@ -100,12 +205,57 @@ impl InferenceBackend for TtsBackend {
         }
 
         let start_time = std::time::Instant::now();
-        let pcm_wav_bytes = vec![
-            0x57, 0x41, 0x56, 0x45, 0x66, 0x6D, 0x74, 0x20,
-            0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
-            0x44, 0xAC, 0x00, 0x00, 0x88, 0x58, 0x01, 0x00,
-            0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61,
-        ];
+
+        let pcm_wav_bytes = if self.process.is_some() {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
+            let payload = serde_json::json!({
+                "text": request.prompt,
+                "voice": "af_heart",
+                "speed": 1.0,
+            });
+
+            let url = format!("http://127.0.0.1:{}/synthesize", self.port);
+            let response = client
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| BackendError::InferenceError(format!("kokoro_tts_server connection error: {}", e)))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_text = response.text().await.unwrap_or_default();
+                return Err(BackendError::InferenceError(format!(
+                    "kokoro_tts_server HTTP {} error: {}",
+                    status, err_text
+                )));
+            }
+
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| BackendError::InferenceError(format!("kokoro_tts_server response parse error: {}", e)))?;
+
+            let audio_b64 = body["audio_b64"]
+                .as_str()
+                .ok_or_else(|| BackendError::InferenceError("kokoro_tts_server response missing audio_b64".to_string()))?;
+
+            base64::engine::general_purpose::STANDARD
+                .decode(audio_b64)
+                .map_err(|e| BackendError::InferenceError(format!("Failed to decode audio_b64: {}", e)))?
+        } else {
+            // Simulation mode: no Python server running (e.g. missing model file).
+            vec![
+                0x57, 0x41, 0x56, 0x45, 0x66, 0x6D, 0x74, 0x20,
+                0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+                0x44, 0xAC, 0x00, 0x00, 0x88, 0x58, 0x01, 0x00,
+                0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61,
+            ]
+        };
 
         let duration = start_time.elapsed().as_millis() as u64;
 

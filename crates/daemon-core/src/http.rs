@@ -21,7 +21,7 @@ use llama_backend::process_tracker::ChildRegistry;
 use moe_cache::MoeExpertCache;
 use pool_protocol::{ClusterPoolManager, PeerNode};
 
-/// Per-model entry for a running llama-server instance
+/// Per-model entry for a running inference backend instance
 #[derive(Debug, Serialize, Clone)]
 pub struct LoadedModelEntry {
     pub model_id: String,
@@ -29,6 +29,7 @@ pub struct LoadedModelEntry {
     pub gpu_layers: u32,
     pub context_size: u32,
     pub port: u16,
+    pub modality: String,
 }
 
 /// Backwards-compat status for single-model callers
@@ -63,6 +64,17 @@ pub struct AppState {
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_dispatcher: Arc<ToolDispatcher>,
     pub media_store: Arc<MediaStore>,
+    /// Tracks in-progress Hugging Face model downloads, keyed by filename.
+    pub hf_downloads: Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadProgress {
+    pub filename: String,
+    pub total_bytes: Option<u64>,
+    pub downloaded_bytes: u64,
+    pub status: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +204,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/moe/stats", get(get_moe_stats))
         .route("/v1/cluster/nodes", get(list_cluster_nodes))
+        .route("/v1/model/hf-search", get(hf_search))
+        .route("/v1/model/hf-files", get(hf_files))
+        .route("/v1/model/hf-download", post(hf_download))
+        .route("/v1/model/hf-download/status", get(hf_download_status))
         .with_state(state)
 }
 
@@ -1657,8 +1673,23 @@ async fn synthesize_speech(
             b.is_loaded()
         };
         if !is_loaded {
+            let tts_model_path = {
+                let models = state.loaded_models.lock().await;
+                models
+                    .values()
+                    .find(|entry| entry.modality == "tts")
+                    .map(|entry| entry.model_path.clone())
+            };
+            let Some(tts_model_path) = tts_model_path else {
+                return Err((
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "No TTS model loaded. Load a TTS model first.".to_string(),
+                ));
+            };
             let mut b = backend_arc.write().await;
-            let _ = b.load_model(std::path::Path::new("models/kokoro.onnx"), &backend_trait::LoadOptions::default()).await;
+            let _ = b
+                .load_model(std::path::Path::new(&tts_model_path), &backend_trait::LoadOptions::default())
+                .await;
         }
     }
 
@@ -1795,11 +1826,22 @@ fn detect_model_modality(path: &std::path::Path) -> String {
                 "text".to_string()
             }
         }
-        "bin" | "onnx" => {
+        "bin" => {
             if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("piper") {
                 "tts".to_string()
             } else {
                 "audio".to_string()
+            }
+        }
+        "onnx" => {
+            if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("asr") {
+                "audio".to_string()
+            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("unet") || file_name.contains("vae") {
+                "image".to_string()
+            } else if file_name.contains("video") || file_name.contains("wan") {
+                "video".to_string()
+            } else {
+                "tts".to_string()
             }
         }
         "ot" | "tflite" | "mlmodel" | "engine" => "text".to_string(),
@@ -1911,8 +1953,9 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
 /// Locate AIATM's own `models` directory without depending on how the daemon
 /// was launched. This supports development builds, packaged binaries, and an
 /// explicit deployment override through `AIATM_MODELS_DIR`.
-async fn list_detected_models() -> Json<Vec<DetectedModelEntry>> {
-    let mut entries = Vec::new();
+/// Resolve the local models directory using the same search order as the
+/// model catalog. Returns the first existing directory found.
+fn resolve_models_dir() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(directory) = std::env::var("AIATM_MODELS_DIR") {
@@ -1930,11 +1973,14 @@ async fn list_detected_models() -> Json<Vec<DetectedModelEntry>> {
     // development reliable even when the binary is built into another target dir.
     candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..\\..").join("models"));
 
-    for directory in candidates {
-        if directory.is_dir() {
-                collect_model_files(&directory, &mut entries);
-            break;
-        }
+    candidates.into_iter().find(|directory| directory.is_dir())
+}
+
+async fn list_detected_models() -> Json<Vec<DetectedModelEntry>> {
+    let mut entries = Vec::new();
+
+    if let Some(directory) = resolve_models_dir() {
+        collect_model_files(&directory, &mut entries);
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     for e in &entries {
@@ -1972,6 +2018,278 @@ async fn list_loaded_models(
     Json(entries)
 }
 
+// ---------------------------------------------------------------------------
+// Hugging Face model search & download
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct HfSearchQuery {
+    q: Option<String>,
+    sort: Option<String>,
+    filter: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct HfModelResult {
+    id: String,
+    author: Option<String>,
+    #[serde(rename = "modelId")]
+    model_id: Option<String>,
+    #[serde(default)]
+    downloads: i64,
+    #[serde(default)]
+    likes: i64,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(rename = "lastModified")]
+    last_modified: Option<String>,
+    #[serde(default)]
+    private: bool,
+}
+
+async fn hf_search(
+    axum::extract::Query(params): axum::extract::Query<HfSearchQuery>,
+) -> Json<Vec<HfModelResult>> {
+    let mut filter_tags: Vec<String> = vec!["gguf".to_string()];
+    if let Some(filter) = &params.filter {
+        for tag in filter.split(',') {
+            let tag = tag.trim();
+            if !tag.is_empty() && tag != "gguf" {
+                filter_tags.push(tag.to_string());
+            }
+        }
+    }
+    let sort = params.sort.unwrap_or_else(|| "trendingScore".to_string());
+
+    let client = match reqwest::Client::builder()
+        .user_agent("antioom-ai/0.1")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Json(Vec::new()),
+    };
+
+    let mut request = client
+        .get("https://huggingface.co/api/models")
+        .query(&[("limit", "20"), ("sort", sort.as_str())])
+        .query(&[("filter", filter_tags.join(","))]);
+
+    if let Some(q) = params.q.as_ref().filter(|q| !q.is_empty()) {
+        request = request.query(&[("search", q.as_str())]);
+    }
+
+    let response = match request.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!("hf-search request failed: {err}");
+            return Json(Vec::new());
+        }
+    };
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!("hf-search returned error: {body}");
+        return Json(Vec::new());
+    }
+
+    match response.json::<Vec<HfModelResult>>().await {
+        Ok(results) => Json(results),
+        Err(err) => {
+            tracing::warn!("hf-search parse failed: {err}");
+            Json(Vec::new())
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HfFilesQuery {
+    repo: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfSibling {
+    rfilename: String,
+    size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfRepoInfo {
+    #[serde(default)]
+    siblings: Vec<HfSibling>,
+}
+
+#[derive(Debug, Serialize)]
+struct HfFileEntry {
+    filename: String,
+    size: Option<u64>,
+}
+
+async fn hf_files(
+    axum::extract::Query(params): axum::extract::Query<HfFilesQuery>,
+) -> Json<Vec<HfFileEntry>> {
+    let client = match reqwest::Client::builder()
+        .user_agent("antioom-ai/0.1")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Json(Vec::new()),
+    };
+
+    let url = format!("https://huggingface.co/api/models/{}", params.repo);
+    let response = match client.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!("hf-files request failed: {err}");
+            return Json(Vec::new());
+        }
+    };
+
+    let info = match response.json::<HfRepoInfo>().await {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!("hf-files parse failed: {err}");
+            return Json(Vec::new());
+        }
+    };
+
+    let files = info
+        .siblings
+        .into_iter()
+        .filter(|s| s.rfilename.ends_with(".gguf"))
+        .map(|s| HfFileEntry {
+            filename: s.rfilename,
+            size: s.size,
+        })
+        .collect();
+
+    Json(files)
+}
+
+#[derive(Debug, Deserialize)]
+struct HfDownloadRequest {
+    repo: String,
+    filename: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HfDownloadResponse {
+    status: &'static str,
+    path: String,
+}
+
+async fn hf_download(
+    State(state): State<AppState>,
+    Json(payload): Json<HfDownloadRequest>,
+) -> Json<HfDownloadResponse> {
+    let models_dir = resolve_models_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("models"));
+    let save_path = models_dir.join(&payload.filename);
+    let save_path_string = save_path.to_string_lossy().to_string();
+
+    {
+        let mut downloads = state.hf_downloads.lock().await;
+        downloads.insert(
+            payload.filename.clone(),
+            DownloadProgress {
+                filename: payload.filename.clone(),
+                total_bytes: None,
+                downloaded_bytes: 0,
+                status: "downloading".to_string(),
+                error: None,
+            },
+        );
+    }
+
+    let downloads_map = state.hf_downloads.clone();
+    let repo = payload.repo.clone();
+    let filename = payload.filename.clone();
+    let target_path = save_path.clone();
+
+    tokio::spawn(async move {
+        if let Err(err) = run_hf_download(&repo, &filename, &target_path, &downloads_map).await {
+            tracing::warn!("hf-download failed for {filename}: {err}");
+            let mut downloads = downloads_map.lock().await;
+            if let Some(entry) = downloads.get_mut(&filename) {
+                entry.status = "error".to_string();
+                entry.error = Some(err.to_string());
+            }
+        }
+    });
+
+    Json(HfDownloadResponse {
+        status: "downloading",
+        path: save_path_string,
+    })
+}
+
+async fn run_hf_download(
+    repo: &str,
+    filename: &str,
+    target_path: &std::path::Path,
+    downloads_map: &Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
+) -> Result<(), String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("antioom-ai/0.1")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    let total_bytes = response.content_length();
+    {
+        let mut downloads = downloads_map.lock().await;
+        if let Some(entry) = downloads.get_mut(filename) {
+            entry.total_bytes = total_bytes;
+        }
+    }
+
+    let mut file = tokio::fs::File::create(target_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut stream = response.bytes_stream();
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        let mut downloads = downloads_map.lock().await;
+        if let Some(entry) = downloads.get_mut(filename) {
+            entry.downloaded_bytes = downloaded;
+        }
+    }
+    file.flush().await.map_err(|e| e.to_string())?;
+
+    let mut downloads = downloads_map.lock().await;
+    if let Some(entry) = downloads.get_mut(filename) {
+        entry.status = "complete".to_string();
+    }
+    Ok(())
+}
+
+async fn hf_download_status(
+    State(state): State<AppState>,
+) -> Json<HashMap<String, DownloadProgress>> {
+    let downloads = state.hf_downloads.lock().await;
+    Json(downloads.clone())
+}
+
 /// Find llama-server binary (same logic as in llama-backend)
 fn find_llama_server_binary() -> Option<std::path::PathBuf> {
     let lmstudio_dir = std::env::var("USERPROFILE")
@@ -1995,7 +2313,7 @@ fn new_model_id(port: u16) -> String {
     format!("mdl-{}-{}", ts, port)
 }
 
-/// Load a model: spawn a new llama-server on the next free port, register in loaded_models.
+/// Load a model: detect modality and spawn the appropriate backend.
 async fn load_model(
     State(state): State<AppState>,
     Json(payload): Json<ModelLoadRequest>,
@@ -2008,60 +2326,127 @@ async fn load_model(
 
     let gpu_layers = payload.gpu_layers.unwrap_or(99);
     let context_size = payload.context_size.unwrap_or(4096);
+    let modality = detect_model_modality(&model_path);
+    tracing::info!("Detected modality '{}' for model: {}", modality, model_path.display());
 
     // Allocate a new port
     let port = state.next_port.fetch_add(1, AtomicOrdering::SeqCst);
     let model_id = new_model_id(port);
 
-    // Spawn a dedicated llama-server for this model
-    if let Some(server_bin) = find_llama_server_binary() {
-        let mut child_cmd = std::process::Command::new(&server_bin);
-        child_cmd
-            .arg("-m").arg(&model_path)
-            .arg("--port").arg(port.to_string())
-            .arg("-ngl").arg(gpu_layers.to_string())
-            .arg("-c").arg(context_size.to_string())
-            .arg("--host").arg("127.0.0.1");
-        tracing::info!("load_model: model_path={}, parent={:?}, payload.mmproj_path={:?}",
-            model_path.display(), model_path.parent(), payload.mmproj_path);
-        let mmproj = payload.mmproj_path
-            .as_ref()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .filter(|p| {
-                let exists = p.exists();
-                tracing::info!("Provided mmproj_path exists={}: {}", exists, p.display());
-                exists
-            })
-            .or_else(|| {
-                let result = find_sibling_mmproj(&model_path);
-                tracing::info!("find_sibling_mmproj result: {:?}", result);
-                result
-            });
-        if let Some(mmproj_path) = &mmproj {
-            tracing::info!("Using vision projector: {}", mmproj_path.display());
-            child_cmd.arg("--mmproj").arg(mmproj_path);
-        } else {
-            tracing::warn!("No vision projector found for model: {}", model_path.display());
-        }
-        let child = child_cmd.spawn();
-        match child {
-            Ok(c) => {
-                // Hand ownership of the Child to the registry so shutdown /
-                // explicit unload can terminate it. (Previously `_c` was
-                // discarded here, leaking the spawned process.)
-                state.children.register(model_id.clone(), c);
-                // Give the server time to start
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    match modality.as_str() {
+        "tts" => {
+            tracing::info!("Loading TTS model via TTS backend: {}", model_path.display());
+            let backend_arc = state.registry.get_backend(Modality::AudioTts).await;
+            if let Some(backend_arc) = backend_arc {
+                let mut b = backend_arc.write().await;
+                let opts = backend_trait::LoadOptions {
+                    gpu_layers: Some(gpu_layers),
+                    context_size: Some(context_size),
+                    ..Default::default()
+                };
+                if let Err(e) = b.load_model(&model_path, &opts).await {
+                    tracing::warn!("TTS backend load_model error: {}", e);
+                }
+            } else {
+                tracing::warn!("No TTS backend registered; model registered but inference will fail");
             }
-            Err(e) => {
-                tracing::warn!("Failed to spawn llama-server on port {}: {}", port, e);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        "audio" => {
+            tracing::info!("Loading ASR model via whisper backend: {}", model_path.display());
+            let backend_arc = state.registry.get_backend(Modality::AudioAsr).await;
+            if let Some(backend_arc) = backend_arc {
+                let mut b = backend_arc.write().await;
+                let opts = backend_trait::LoadOptions {
+                    gpu_layers: Some(gpu_layers),
+                    context_size: Some(context_size),
+                    ..Default::default()
+                };
+                if let Err(e) = b.load_model(&model_path, &opts).await {
+                    tracing::warn!("ASR backend load_model error: {}", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        "image" => {
+            tracing::info!("Loading image model via SD backend: {}", model_path.display());
+            let backend_arc = state.registry.get_backend(Modality::Image).await;
+            if let Some(backend_arc) = backend_arc {
+                let mut b = backend_arc.write().await;
+                let opts = backend_trait::LoadOptions {
+                    gpu_layers: Some(gpu_layers),
+                    context_size: Some(context_size),
+                    ..Default::default()
+                };
+                if let Err(e) = b.load_model(&model_path, &opts).await {
+                    tracing::warn!("Image backend load_model error: {}", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        "video" => {
+            tracing::info!("Loading video model via video backend: {}", model_path.display());
+            let backend_arc = state.registry.get_backend(Modality::Video).await;
+            if let Some(backend_arc) = backend_arc {
+                let mut b = backend_arc.write().await;
+                let opts = backend_trait::LoadOptions {
+                    gpu_layers: Some(gpu_layers),
+                    context_size: Some(context_size),
+                    ..Default::default()
+                };
+                if let Err(e) = b.load_model(&model_path, &opts).await {
+                    tracing::warn!("Video backend load_model error: {}", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        _ => {
+            // text / vision / unknown — use llama-server
+            if let Some(server_bin) = find_llama_server_binary() {
+                let mut child_cmd = std::process::Command::new(&server_bin);
+                child_cmd
+                    .arg("-m").arg(&model_path)
+                    .arg("--port").arg(port.to_string())
+                    .arg("-ngl").arg(gpu_layers.to_string())
+                    .arg("-c").arg(context_size.to_string())
+                    .arg("--host").arg("127.0.0.1");
+                tracing::info!("load_model: model_path={}, parent={:?}, payload.mmproj_path={:?}",
+                    model_path.display(), model_path.parent(), payload.mmproj_path);
+                let mmproj = payload.mmproj_path
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| {
+                        let exists = p.exists();
+                        tracing::info!("Provided mmproj_path exists={}: {}", exists, p.display());
+                        exists
+                    })
+                    .or_else(|| {
+                        let result = find_sibling_mmproj(&model_path);
+                        tracing::info!("find_sibling_mmproj result: {:?}", result);
+                        result
+                    });
+                if let Some(mmproj_path) = &mmproj {
+                    tracing::info!("Using vision projector: {}", mmproj_path.display());
+                    child_cmd.arg("--mmproj").arg(mmproj_path);
+                } else {
+                    tracing::warn!("No vision projector found for model: {}", model_path.display());
+                }
+                let child = child_cmd.spawn();
+                match child {
+                    Ok(c) => {
+                        state.children.register(model_id.clone(), c);
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to spawn llama-server on port {}: {}", port, e);
+                    }
+                }
+            } else {
+                tracing::info!("llama-server binary not found; registering model in simulation mode on port {}", port);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
-    } else {
-        tracing::info!("llama-server binary not found; registering model in simulation mode on port {}", port);
-        // In simulation mode, still wait a moment so the UI feels responsive
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     let entry = LoadedModelEntry {
@@ -2070,6 +2455,7 @@ async fn load_model(
         gpu_layers,
         context_size,
         port,
+        modality: modality.clone(),
     };
 
     {

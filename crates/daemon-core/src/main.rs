@@ -124,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tool_registry,
         tool_dispatcher,
         media_store,
+        hf_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
     let app = http::create_router(http_state);
     let http_addr: SocketAddr = "0.0.0.0:8080".parse()?;
