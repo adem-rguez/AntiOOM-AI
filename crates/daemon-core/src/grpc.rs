@@ -56,6 +56,8 @@ impl DaemonService for DaemonGrpcService {
             } else {
                 Some(req.image_input)
             },
+            tools: None,
+            tool_choice: None,
         };
 
         let backend = backend_arc.read().await;

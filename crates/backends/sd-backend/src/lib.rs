@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use backend_trait::{
     BackendError, InferenceBackend, InferenceChunk, InferenceRequest, InferenceResponse,
-    InferenceStream, LoadOptions, Modality, VramEstimate,
+    InferenceStream, LoadOptions, Modality, ToolSchema, VramEstimate,
 };
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,6 +125,8 @@ impl InferenceBackend for SdBackend {
             output_data: Some(png_bytes),
             tokens_generated: 1,
             generation_time_ms: duration,
+            tool_calls: None,
+            finish_reason: None,
         })
     }
 
@@ -142,8 +144,25 @@ impl InferenceBackend for SdBackend {
             delta_text: "Generating image steps...".to_string(),
             delta_data: None,
             is_final: true,
+            delta_tool_call: None,
         })];
 
         Ok(Box::pin(stream::iter(chunks)))
+    }
+
+    fn as_tool_schema(&self) -> Option<ToolSchema> {
+        Some(ToolSchema {
+            name: "generate_image".into(),
+            description: "Generate an image from a text description. Returns image data.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Detailed description of the image to generate"},
+                    "size": {"type": "string", "enum": ["512x512", "768x768", "1024x1024"], "default": "512x512"},
+                    "negative_prompt": {"type": "string", "description": "What to exclude from the image"}
+                },
+                "required": ["prompt"]
+            }),
+        })
     }
 }

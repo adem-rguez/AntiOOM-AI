@@ -1094,6 +1094,29 @@ input[type="text"], input[type="number"], select {
   border-color: var(--accent-purple);
 }
 
+.mmproj-row {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+.mmproj-row .control-input {
+  flex: 1;
+  min-width: 0;
+}
+.mmproj-row .btn-browse {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  border-radius: 6px;
+  border: 1px solid var(--border-highlight);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.mmproj-row .btn-browse:hover {
+  background: var(--card-hover);
+}
+
 .slider-header {
   display: flex;
   justify-content: space-between;
@@ -1216,4 +1239,103 @@ input[type="text"], input[type="number"], select {
 
 .btn-unload-model:hover {
   background: rgba(239, 68, 68, 0.2);
+}
+
+.btn-remove-card {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.3rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.btn-remove-card:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+/* Model Picker Modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: config-fade-in 0.18s ease-out;
+}
+
+.modal-container {
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.modal-header h3 {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.modal-body {
+  padding: 1rem 1.1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow: hidden;
+}
+
+.modal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  overflow-y: auto;
+  max-height: 50vh;
+}
+
+.modal-list-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  background: var(--bg-dark);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+}
+
+.modal-list-item:hover {
+  border-color: var(--border-highlight);
+  background: var(--card-bg);
+}
+
+.modal-list-item-meta {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
 }

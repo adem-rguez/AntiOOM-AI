@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use backend_trait::{
     BackendError, InferenceBackend, InferenceChunk, InferenceRequest, InferenceResponse,
-    InferenceStream, LoadOptions, Modality, VramEstimate,
+    InferenceStream, LoadOptions, Modality, ToolSchema, VramEstimate,
 };
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +115,8 @@ impl InferenceBackend for TtsBackend {
             output_data: Some(pcm_wav_bytes),
             tokens_generated: 1,
             generation_time_ms: duration,
+            tool_calls: None,
+            finish_reason: None,
         })
     }
 
@@ -132,8 +134,24 @@ impl InferenceBackend for TtsBackend {
             delta_text: "Synthesizing audio frames...".to_string(),
             delta_data: None,
             is_final: true,
+            delta_tool_call: None,
         })];
 
         Ok(Box::pin(stream::iter(chunks)))
+    }
+
+    fn as_tool_schema(&self) -> Option<ToolSchema> {
+        Some(ToolSchema {
+            name: "speak_text".into(),
+            description: "Convert text to spoken audio. Returns audio data.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The text to speak aloud"},
+                    "voice": {"type": "string", "description": "Voice preset to use"}
+                },
+                "required": ["text"]
+            }),
+        })
     }
 }

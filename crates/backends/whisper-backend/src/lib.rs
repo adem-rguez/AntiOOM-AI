@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use backend_trait::{
     BackendError, InferenceBackend, InferenceChunk, InferenceRequest, InferenceResponse,
-    InferenceStream, LoadOptions, Modality, VramEstimate,
+    InferenceStream, LoadOptions, Modality, ToolSchema, VramEstimate,
 };
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +108,8 @@ impl InferenceBackend for WhisperBackend {
             output_data: None,
             tokens_generated: 8,
             generation_time_ms: duration,
+            tool_calls: None,
+            finish_reason: None,
         })
     }
 
@@ -125,8 +127,24 @@ impl InferenceBackend for WhisperBackend {
             delta_text: "[Transcribing audio...]".to_string(),
             delta_data: None,
             is_final: true,
+            delta_tool_call: None,
         })];
 
         Ok(Box::pin(stream::iter(chunks)))
+    }
+
+    fn as_tool_schema(&self) -> Option<ToolSchema> {
+        Some(ToolSchema {
+            name: "transcribe_audio".into(),
+            description: "Transcribe audio to text. Returns transcription text.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "audio_data": {"type": "string", "description": "Base64-encoded audio data to transcribe"},
+                    "language": {"type": "string", "description": "Language code (e.g. 'en', 'fr')"}
+                },
+                "required": ["audio_data"]
+            }),
+        })
     }
 }

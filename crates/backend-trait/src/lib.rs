@@ -66,9 +66,50 @@ impl Default for SamplingParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_delta: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub tool_call_id: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_data: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +123,10 @@ pub struct InferenceRequest {
     pub sampling: SamplingParams,
     pub modality: Modality,
     pub image_input: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolSchema>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +136,10 @@ pub struct InferenceResponse {
     pub output_data: Option<Vec<u8>>,
     pub tokens_generated: u32,
     pub generation_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +148,8 @@ pub struct InferenceChunk {
     pub delta_text: String,
     pub delta_data: Option<Vec<u8>>,
     pub is_final: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_tool_call: Option<ToolCallDelta>,
 }
 
 pub type InferenceStream = Pin<Box<dyn Stream<Item = Result<InferenceChunk, BackendError>> + Send>>;
@@ -158,4 +209,6 @@ pub trait InferenceBackend: Send + Sync {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceStream, BackendError>;
+
+    fn as_tool_schema(&self) -> Option<ToolSchema> { None }
 }

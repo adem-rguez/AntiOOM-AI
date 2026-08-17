@@ -337,6 +337,8 @@ impl InferenceBackend for LlamaBackend {
             output_data: None,
             tokens_generated: tokens,
             generation_time_ms: duration,
+            tool_calls: None,
+            finish_reason: None,
         })
     }
 
@@ -355,18 +357,21 @@ impl InferenceBackend for LlamaBackend {
                 delta_text: "[llama.cpp stream start: ".to_string(),
                 delta_data: None,
                 is_final: false,
+                delta_tool_call: None,
             }),
             Ok(InferenceChunk {
                 request_id: req_id.clone(),
                 delta_text: request.prompt.clone(),
                 delta_data: None,
                 is_final: false,
+                delta_tool_call: None,
             }),
             Ok(InferenceChunk {
                 request_id: req_id,
                 delta_text: "]".to_string(),
                 delta_data: None,
                 is_final: true,
+                delta_tool_call: None,
             }),
         ];
 

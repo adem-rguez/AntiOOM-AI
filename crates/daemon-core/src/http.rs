@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::registry::BackendRegistry;
 use crate::profiler::{FitEstimationRequest, FitEstimationResult, HardwareProfiler, SystemHardwareInfo};
 use crate::session::{ActiveSession, SessionManager};
-use backend_trait::{ChatMessage, InferenceRequest, Modality, SamplingParams};
+use crate::tool_registry::ToolRegistry;
+use crate::tool_dispatcher::ToolDispatcher;
+use crate::tool_fallback;
+use crate::media_store::MediaStore;
+use backend_trait::{InferenceRequest, Modality, SamplingParams, ToolCall};
 use llama_backend::process_tracker::ChildRegistry;
 use moe_cache::MoeExpertCache;
 use pool_protocol::{ClusterPoolManager, PeerNode};
@@ -56,25 +60,19 @@ pub struct AppState {
     pub children: Arc<ChildRegistry>,
     /// Broadcast channel for graceful shutdown. Sent by `/shutdown` endpoint.
     pub shutdown_signal: tokio::sync::broadcast::Sender<()>,
+    pub tool_registry: Arc<ToolRegistry>,
+    pub tool_dispatcher: Arc<ToolDispatcher>,
+    pub media_store: Arc<MediaStore>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionMessage {
     pub role: String,
     pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
-fn message_text(content: &serde_json::Value) -> String {
-    match content {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(parts) => parts.iter().filter_map(|part| {
-            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                part.get("text").and_then(|value| value.as_str()).map(ToOwned::to_owned)
-            } else { None }
-        }).collect::<Vec<_>>().join("\n"),
-        _ => String::new(),
-    }
-}
 /// Decode and return image bytes from any `image_url` data URL found in the
 /// OpenAI-style chat-completion payload's messages. Returns the first image.
 fn extract_image_input(messages: &[ChatCompletionMessage]) -> Option<Vec<u8>> {
@@ -109,6 +107,8 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub enable_tools: Option<bool>,
+    pub tool_choice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +178,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/completions/stream", post(stream_chat_completions))
+        .route("/v1/media/:id", get(get_media))
         .route("/v1/images/generations", post(generate_images))
         .route("/v1/audio/transcriptions", post(transcribe_audio))
         .route("/v1/audio/speech", post(synthesize_speech))
@@ -263,6 +264,22 @@ async fn list_cluster_nodes(
     State(state): State<AppState>,
 ) -> Json<Vec<PeerNode>> {
     Json(state.cluster_pool.list_nodes().await)
+}
+
+async fn get_media(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    match state.media_store.get(&id).await {
+        Some((data, mime_type)) => {
+            Ok(axum::response::Response::builder()
+                .header("Content-Type", mime_type)
+                .header("Cache-Control", "public, max-age=1800")
+                .body(axum::body::Body::from(data))
+                .unwrap())
+        }
+        None => Err((axum::http::StatusCode::NOT_FOUND, "Media not found or expired".into())),
+    }
 }
 
 async fn dashboard_landing() -> Html<&'static str> {
@@ -1081,6 +1098,7 @@ struct StreamChatRequest {
     /// Optional: route inference to a specific loaded model by its model_id.
     /// If absent, routes to the first loaded model (or falls back to port 50052).
     pub model_id: Option<String>,
+    pub enable_tools: Option<bool>,
     #[serde(flatten)]
     pub inner: ChatCompletionRequest,
 }
@@ -1137,8 +1155,21 @@ async fn stream_chat_completions(
     } else {
         None
     };
+    let tools_enabled = payload.enable_tools.unwrap_or(false) || payload.inner.enable_tools.unwrap_or(false);
+    let tool_schemas = if tools_enabled {
+        state.tool_registry.get_available_tools(Some(Modality::Text)).await
+    } else {
+        vec![]
+    };
+    let system_content = if !tool_schemas.is_empty() {
+        let fallback_prompt = tool_fallback::build_tool_prompt(&tool_schemas);
+        format!("You are a helpful, knowledgeable AI assistant.{}", fallback_prompt)
+    } else {
+        "You are a helpful, knowledgeable AI assistant.".to_string()
+    };
+
     let mut chat_messages: Vec<serde_json::Value> = vec![
-        serde_json::json!({ "role": "system", "content": "You are a helpful, knowledgeable AI assistant." })
+        serde_json::json!({ "role": "system", "content": system_content })
     ];
     for (i, msg) in payload.inner.messages.iter().enumerate() {
         if Some(i) == last_user_idx && has_image {
@@ -1156,7 +1187,7 @@ async fn stream_chat_completions(
         }
     }
 
-    let req_body = serde_json::json!({
+    let mut req_body = serde_json::json!({
         "model": "local",
         "messages": chat_messages,
         "max_tokens": payload.inner.max_tokens.unwrap_or(4096),
@@ -1166,6 +1197,20 @@ async fn stream_chat_completions(
         "stream": true,
         "thinking": true,
     });
+
+    if !tool_schemas.is_empty() {
+        let tools_json: Vec<serde_json::Value> = tool_schemas.iter().map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        }).collect();
+        req_body["tools"] = serde_json::Value::Array(tools_json);
+    }
 
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
     let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
@@ -1202,105 +1247,276 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Result<Json<ChatCompletionResponse>, (axum::http::StatusCode, String)> {
-    let backend_arc = state
-        .registry
-        .get_backend(Modality::Text)
-        .await
-        .ok_or((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "No text backend registered".to_string(),
-        ))?;
+    let tools_enabled = payload.enable_tools.unwrap_or(false);
 
-    let chat_messages: Vec<ChatMessage> = {
-        let mut msgs = vec![ChatMessage {
-            role: "system".to_string(),
-            content: "You are a helpful, knowledgeable AI assistant.".to_string(),
-        }];
-        for msg in &payload.messages {
-            msgs.push(ChatMessage {
-                role: msg.role.clone(),
-                content: message_text(&msg.content),
-            });
-        }
-        msgs
+    // Determine port (same logic as streaming path)
+    let port: u16 = {
+        let models = state.loaded_models.lock().await;
+        models.values().next().map(|e| e.port).unwrap_or(50052)
     };
 
-    // Keep a plain prompt string as fallback for non-chat backends
-    let fallback_prompt = {
-        let mut p = String::new();
-        p.push_str("<|im_start|>system\nYou are a helpful, knowledgeable AI assistant.<|im_end|>\n");
-        for msg in &payload.messages {
-            p.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, message_text(&msg.content)));
-        }
-        p.push_str("<|im_start|>assistant\n");
-        p
-    };
-
-    let request_id = format!("chatcmpl-{}", uuid_simple());
-    state
-        .session_manager
-        .create_session(request_id.clone(), payload.model.clone(), fallback_prompt.clone())
-        .await;
-
-    let inf_req = InferenceRequest {
-        request_id: request_id.clone(),
-        prompt: fallback_prompt,
-        messages: Some(chat_messages),
-        sampling: SamplingParams {
-            temperature: payload.temperature.unwrap_or(0.7),
-            top_p: payload.top_p.unwrap_or(0.9),
-            top_k: 40,
-            max_tokens: payload.max_tokens.unwrap_or(4096),
-            stop_sequences: vec!["".to_string(), "".to_string(), "</s>".to_string()],
-        },
-        modality: Modality::Text,
-        image_input: extract_image_input(&payload.messages),
-    };
-
-    {
-        let is_loaded = {
-            let b = backend_arc.read().await;
-            b.is_loaded()
-        };
+    // Auto-load if nothing loaded (backwards compat)
+    let nothing_loaded = state.loaded_models.lock().await.is_empty();
+    if nothing_loaded {
+        let backend_arc = state.registry.get_backend(Modality::Text).await
+            .ok_or((axum::http::StatusCode::SERVICE_UNAVAILABLE, "No text backend registered".into()))?;
+        let is_loaded = { backend_arc.read().await.is_loaded() };
         if !is_loaded {
             let model_path = std::path::PathBuf::from(&payload.model);
             let mut b = backend_arc.write().await;
-            let load_path = if model_path.exists() {
-                model_path
-            } else {
-                std::path::PathBuf::from("models/default.gguf")
-            };
+            let load_path = if model_path.exists() { model_path } else { std::path::PathBuf::from("models/default.gguf") };
             let _ = b.load_model(&load_path, &backend_trait::LoadOptions::default()).await;
         }
     }
 
-    let backend = backend_arc.read().await;
-    let inf_res = backend.generate(inf_req).await.map_err(|e| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            e.to_string(),
-        )
-    })?;
+    // Build messages
+    let has_image = extract_image_input(&payload.messages).is_some();
+    let last_user_idx = if has_image {
+        payload.messages.iter().rposition(|m| m.role == "user")
+    } else {
+        None
+    };
 
-    let response = ChatCompletionResponse {
+    let mut chat_messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "system", "content": "You are a helpful, knowledgeable AI assistant."})
+    ];
+
+    // If tools enabled but we want to use prompt-based fallback, append tool instructions to system prompt
+    let tool_schemas = if tools_enabled {
+        state.tool_registry.get_available_tools(Some(Modality::Text)).await
+    } else {
+        vec![]
+    };
+
+    for (i, msg) in payload.messages.iter().enumerate() {
+        if Some(i) == last_user_idx && has_image {
+            let content = match &msg.content {
+                serde_json::Value::Array(parts) => parts.clone(),
+                serde_json::Value::String(s) => vec![serde_json::json!({"type":"text","text":s})],
+                _ => vec![],
+            };
+            chat_messages.push(serde_json::json!({"role": msg.role, "content": content}));
+        } else {
+            chat_messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+        }
+    }
+
+    let request_id = format!("chatcmpl-{}", uuid_simple());
+
+    // Build the request body — include tools if enabled
+    let mut req_body = serde_json::json!({
+        "model": "local",
+        "messages": chat_messages,
+        "max_tokens": payload.max_tokens.unwrap_or(4096),
+        "temperature": payload.temperature.unwrap_or(0.7),
+        "top_p": payload.top_p.unwrap_or(0.9),
+        "repeat_penalty": 1.15,
+        "thinking": true,
+    });
+
+    // Try native tool calling first
+    if !tool_schemas.is_empty() {
+        let tools_json: Vec<serde_json::Value> = tool_schemas.iter().map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        }).collect();
+        req_body["tools"] = serde_json::Value::Array(tools_json);
+        if let Some(tc) = &payload.tool_choice {
+            req_body["tool_choice"] = serde_json::Value::String(tc.clone());
+        }
+    }
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+
+    let res = client.post(&url).json(&req_body).send().await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let err = res.text().await.unwrap_or_default();
+        return Err((axum::http::StatusCode::BAD_GATEWAY, format!("llama-server {} error: {}", status, err)));
+    }
+
+    let body: serde_json::Value = res.json().await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let msg = &body["choices"][0]["message"];
+    let finish_reason = body["choices"][0]["finish_reason"].as_str().unwrap_or("stop");
+
+    // Check for native tool calls in the response
+    let native_tool_calls = msg.get("tool_calls").and_then(|tc| tc.as_array()).cloned();
+
+    // Check for prompt-based fallback tool calls in the content
+    let content_text = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let reasoning = msg.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("");
+
+    let combined_text = if !reasoning.is_empty() {
+        format!("<think>\n{}\n</think>\n\n{}", reasoning, content_text)
+    } else {
+        content_text.to_string()
+    };
+
+    if let Some(ref tool_calls_json) = native_tool_calls {
+        if !tool_calls_json.is_empty() {
+            // Dispatch tool calls
+            let mut tool_results = Vec::new();
+            for tc_json in tool_calls_json {
+                let tc = ToolCall {
+                    id: tc_json["id"].as_str().unwrap_or("").to_string(),
+                    name: tc_json["function"]["name"].as_str().unwrap_or("").to_string(),
+                    arguments: serde_json::from_str(
+                        tc_json["function"]["arguments"].as_str().unwrap_or("{}")
+                    ).unwrap_or(serde_json::json!({})),
+                };
+                let result = state.tool_dispatcher.dispatch(&tc, 0).await;
+                tool_results.push((tc, result));
+            }
+
+            // Re-call the model with tool results
+            for (tc, result) in &tool_results {
+                chat_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        }
+                    }]
+                }));
+                let tool_content = if let Some(ref handle) = result.media_handle {
+                    format!("{}\n[Media available at: {}]", result.content, handle)
+                } else {
+                    result.content.clone()
+                };
+                chat_messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_content,
+                }));
+            }
+
+            // Second call to model (without tools to prevent chaining)
+            let followup_body = serde_json::json!({
+                "model": "local",
+                "messages": chat_messages,
+                "max_tokens": payload.max_tokens.unwrap_or(4096),
+                "temperature": payload.temperature.unwrap_or(0.7),
+                "top_p": payload.top_p.unwrap_or(0.9),
+                "repeat_penalty": 1.15,
+                "thinking": true,
+            });
+
+            let followup_res = client.post(&url).json(&followup_body).send().await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let followup_body: serde_json::Value = followup_res.json().await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+            let followup_msg = &followup_body["choices"][0]["message"];
+            let followup_text = followup_msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let followup_reasoning = followup_msg.get("reasoning_content").and_then(|r| r.as_str()).unwrap_or("");
+            let final_text = if !followup_reasoning.is_empty() {
+                format!("<think>\n{}\n</think>\n\n{}", followup_reasoning, followup_text)
+            } else {
+                followup_text.to_string()
+            };
+
+            return Ok(Json(ChatCompletionResponse {
+                id: request_id,
+                object: "chat.completion".into(),
+                created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                model: payload.model,
+                choices: vec![ChatCompletionChoice {
+                    index: 0,
+                    message: ChatCompletionMessage {
+                        role: "assistant".into(),
+                        content: serde_json::Value::String(final_text),
+                        tool_calls: None,
+                    },
+                    finish_reason: "stop".into(),
+                }],
+            }));
+        }
+    }
+
+    // Check prompt-based fallback if native tools weren't used or didn't produce calls
+    if tools_enabled && !tool_schemas.is_empty() && native_tool_calls.is_none() {
+        if let Some(parsed) = tool_fallback::parse_tool_calls(&combined_text) {
+            let result = state.tool_dispatcher.dispatch(&parsed.tool_call, 0).await;
+            let tool_content = if let Some(ref handle) = result.media_handle {
+                format!("{}\n[Media available at: {}]", result.content, handle)
+            } else {
+                result.content.clone()
+            };
+
+            // Re-call with tool result appended
+            chat_messages.push(serde_json::json!({"role": "assistant", "content": parsed.text_before}));
+            chat_messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("Tool '{}' returned: {}", parsed.tool_call.name, tool_content),
+            }));
+
+            let followup_body = serde_json::json!({
+                "model": "local",
+                "messages": chat_messages,
+                "max_tokens": payload.max_tokens.unwrap_or(4096),
+                "temperature": payload.temperature.unwrap_or(0.7),
+                "top_p": payload.top_p.unwrap_or(0.9),
+                "repeat_penalty": 1.15,
+                "thinking": true,
+            });
+
+            let followup_res = client.post(&url).json(&followup_body).send().await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let followup_body: serde_json::Value = followup_res.json().await
+                .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+            let followup_msg = &followup_body["choices"][0]["message"];
+            let followup_text = followup_msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+            return Ok(Json(ChatCompletionResponse {
+                id: request_id,
+                object: "chat.completion".into(),
+                created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                model: payload.model,
+                choices: vec![ChatCompletionChoice {
+                    index: 0,
+                    message: ChatCompletionMessage {
+                        role: "assistant".into(),
+                        content: serde_json::Value::String(followup_text.to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: "stop".into(),
+                }],
+            }));
+        }
+    }
+
+    // No tool calls — return the normal response
+    Ok(Json(ChatCompletionResponse {
         id: request_id,
-        object: "chat.completion".to_string(),
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        object: "chat.completion".into(),
+        created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         model: payload.model,
         choices: vec![ChatCompletionChoice {
             index: 0,
             message: ChatCompletionMessage {
-                role: "assistant".to_string(),
-                content: serde_json::Value::String(inf_res.output_text),
+                role: "assistant".into(),
+                content: serde_json::Value::String(combined_text),
+                tool_calls: None,
             },
-            finish_reason: "stop".to_string(),
+            finish_reason: finish_reason.to_string(),
         }],
-    };
-
-    Ok(Json(response))
+    }))
 }
 
 async fn generate_images(
@@ -1325,6 +1541,8 @@ async fn generate_images(
         sampling: SamplingParams::default(),
         modality: Modality::Image,
         image_input: None,
+        tools: None,
+        tool_choice: None,
     };
 
     {
@@ -1379,6 +1597,8 @@ async fn transcribe_audio(
         sampling: SamplingParams::default(),
         modality: Modality::AudioAsr,
         image_input: None,
+        tools: None,
+        tool_choice: None,
     };
 
     {
@@ -1427,6 +1647,8 @@ async fn synthesize_speech(
         sampling: SamplingParams::default(),
         modality: Modality::AudioTts,
         image_input: None,
+        tools: None,
+        tool_choice: None,
     };
 
     {
@@ -1497,6 +1719,7 @@ pub struct ModelLoadRequest {
     pub model_path: String,
     pub gpu_layers: Option<u32>,
     pub context_size: Option<u32>,
+    pub mmproj_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1516,14 +1739,23 @@ pub struct DetectedModelEntry {
     pub modality: String,
     /// A vision GGUF also needs a local image projector before chat can accept images.
     pub image_input_available: bool,
+    pub mmproj_path: Option<String>,
+}
+
+fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let directory = path.parent()?;
+    std::fs::read_dir(directory).ok().into_iter().flatten().flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("mmproj") && name.ends_with(".gguf") {
+            Some(entry.path())
+        } else {
+            None
+        }
+    })
 }
 
 fn has_image_projector(path: &std::path::Path) -> bool {
-    let Some(directory) = path.parent() else { return false; };
-    std::fs::read_dir(directory).ok().into_iter().flatten().flatten().any(|entry| {
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        name.contains("mmproj") && name.ends_with(".gguf")
-    })
+    find_sibling_mmproj(path).is_some()
 }
 
 fn detect_model_modality(path: &std::path::Path) -> String {
@@ -1627,6 +1859,11 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
         if path.is_dir() {
             collect_model_files(&path, entries);
         } else if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gguf" | "safetensors" | "ckpt" | "onnx")) {
+            // Skip mmproj companion files — they are not standalone models
+            let file_name_lower = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+            if file_name_lower.contains("mmproj") {
+                continue;
+            }
             let size_bytes = child.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             let modality = detect_model_modality(&path);
             entries.push(DetectedModelEntry {
@@ -1634,7 +1871,8 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 path: path.to_string_lossy().to_string(),
                 size_bytes,
                 max_context_size: gguf_context_length(&path),
-                image_input_available: modality == "vision" && has_image_projector(&path),
+                image_input_available: modality == "vision",
+                mmproj_path: find_sibling_mmproj(&path).map(|p| p.to_string_lossy().to_string()),
                 modality,
             });
         }
@@ -1670,6 +1908,9 @@ async fn list_detected_models() -> Json<Vec<DetectedModelEntry>> {
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in &entries {
+        tracing::info!("catalog entry: name={}, path={}, mmproj_path={:?}", e.name, e.path, e.mmproj_path);
+    }
     Json(entries)
 }
 
@@ -1745,13 +1986,36 @@ async fn load_model(
 
     // Spawn a dedicated llama-server for this model
     if let Some(server_bin) = find_llama_server_binary() {
-        let child = std::process::Command::new(&server_bin)
+        let mut child_cmd = std::process::Command::new(&server_bin);
+        child_cmd
             .arg("-m").arg(&model_path)
             .arg("--port").arg(port.to_string())
             .arg("-ngl").arg(gpu_layers.to_string())
             .arg("-c").arg(context_size.to_string())
-            .arg("--host").arg("127.0.0.1")
-            .spawn();
+            .arg("--host").arg("127.0.0.1");
+        tracing::info!("load_model: model_path={}, parent={:?}, payload.mmproj_path={:?}",
+            model_path.display(), model_path.parent(), payload.mmproj_path);
+        let mmproj = payload.mmproj_path
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|p| {
+                let exists = p.exists();
+                tracing::info!("Provided mmproj_path exists={}: {}", exists, p.display());
+                exists
+            })
+            .or_else(|| {
+                let result = find_sibling_mmproj(&model_path);
+                tracing::info!("find_sibling_mmproj result: {:?}", result);
+                result
+            });
+        if let Some(mmproj_path) = &mmproj {
+            tracing::info!("Using vision projector: {}", mmproj_path.display());
+            child_cmd.arg("--mmproj").arg(mmproj_path);
+        } else {
+            tracing::warn!("No vision projector found for model: {}", model_path.display());
+        }
+        let child = child_cmd.spawn();
         match child {
             Ok(c) => {
                 // Hand ownership of the Child to the registry so shutdown /
@@ -1794,6 +2058,8 @@ async fn load_model(
             context_size: Some(context_size),
         };
     }
+
+    state.tool_registry.refresh(&state.registry).await;
 
     Ok(Json(entry))
 }
@@ -1852,6 +2118,8 @@ async fn unload_model(
             *status = LoadedModelStatus { is_loaded: false, model_path: None, gpu_layers: None, context_size: None };
         }
     }
+
+    state.tool_registry.refresh(&state.registry).await;
 
     let models = state.loaded_models.lock().await;
     Ok(Json(models.values().cloned().collect()))

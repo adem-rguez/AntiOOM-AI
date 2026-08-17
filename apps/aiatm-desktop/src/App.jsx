@@ -136,6 +136,7 @@ export default function App() {
   const [inputPrompt, setInputPrompt] = useState('');
   const [attachments, setAttachments] = useState([]);
   const attachmentInputRef = useRef(null);
+  const mmprojInputRef = useRef(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [appSettings, setAppSettings] = useState(() => {
     try {
@@ -315,6 +316,16 @@ export default function App() {
   const [unloadingModelId, setUnloadingModelId] = useState(null);
   const [modelFitPreview, setModelFitPreview] = useState(null);
   const [detectedModels, setDetectedModels] = useState([]);
+  const [modelCards, setModelCards] = useState(() => {
+    const saved = localStorage.getItem('antioom-model-cards');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [modelPickerSearch, setModelPickerSearch] = useState('');
+
+  useEffect(() => {
+    localStorage.setItem('antioom-model-cards', JSON.stringify(modelCards));
+  }, [modelCards]);
 
   useEffect(() => {
     localStorage.setItem('aiatm.chat-sessions', JSON.stringify(chatSessions));
@@ -351,6 +362,7 @@ export default function App() {
       max_context_size: maxContextSize,
       temperature: preset.defaultTemp ?? 0.7,
       top_p: preset.defaultTopP ?? 0.9,
+      mmproj_path: preset.mmproj_path || detectedModels.find(m => m.path === preset.path)?.mmproj_path || '',
     });
   };
 
@@ -380,6 +392,7 @@ export default function App() {
           model_path: configuration.model_path,
           gpu_layers: configuration.gpu_layers,
           context_size: configuration.context_size,
+          mmproj_path: configuration.mmproj_path || undefined,
         }),
       });
       const data = await res.json();
@@ -387,11 +400,14 @@ export default function App() {
         await fetchLoadedModels();
         fetchSystemInfo();
         setTimeout(fetchSystemInfo, 1500);
+        return data.model_id;
       } else {
         alert('Failed to load model: ' + (data?.error || res.statusText));
+        return null;
       }
     } catch (err) {
       alert('Error loading model: ' + err.message);
+      return null;
     } finally {
       setIsLoadingModel(false);
     }
@@ -1157,32 +1173,107 @@ export default function App() {
 
           {activeTab === 'models' && (
             <div className="tab-panel">
-              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Models</h2>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.3rem' }}>
+                <h2 style={{ fontSize: '1.4rem' }}>Models</h2>
+                <button className="btn-load-model" onClick={() => setShowModelPicker(true)}>
+                  <PackagePlus size={14} /> Add Model
+                </button>
+              </div>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Load multiple local GGUF models and choose which one powers the chat.
               </p>
               <div className="grid-2">
                 <div className="card">
-                  <h3 style={{ marginBottom: '1rem' }}>Catalog</h3>
-                  {detectedModels.map(model => {
-                    const loadedEntry = loadedModels.find(loaded => loaded.model_path === model.path);
+                  <h3 style={{ marginBottom: '1rem' }}>My Models</h3>
+                  {modelCards.map(card => {
+                    const loadedEntry = loadedModels.find(loaded => loaded.model_id === card.loadedModelId);
                     const isLoaded = Boolean(loadedEntry);
                     return (
-                      <div key={model.path} style={{ borderBottom: '1px solid var(--border-color)', padding: '0.85rem 0' }}>
-                        <strong>{model.name}</strong>
-                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{model.modality.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</div>
+                      <div key={card.id} style={{ borderBottom: '1px solid var(--border-color)', padding: '0.85rem 0' }}>
+                        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                          <strong>{card.name}</strong>
+                          <button
+                            className="btn-remove-card"
+                            title="Remove model card"
+                            onClick={async () => {
+                              if (isLoaded) await handleUnloadModel(card.loadedModelId);
+                              setModelCards(current => current.filter(item => item.id !== card.id));
+                            }}
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{card.modality?.toUpperCase()} · {(card.size_bytes / 1e9).toFixed(2)} GB</div>
                         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.25rem' }}>
-                          <button className="btn-load-model" onClick={() => openConfigPanel({ name: model.name, path: model.path, max_context_size: model.max_context_size })}>
+                          <button className="btn-load-model" onClick={() => openConfigPanel({ name: card.name, path: card.modelPath, max_context_size: card.max_context_size, mmproj_path: card.mmproj_path })}>
                             <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
                           </button>
-                          {isLoaded ? <button className="btn-unload-model" onClick={() => handleUnloadModel(loadedEntry.model_id)} disabled={unloadingModelId === loadedEntry.model_id}><Power size={14} /> Eject</button>
-                          : <button className="btn-load-model" onClick={() => handleLoadModel({ model_path: model.path, gpu_layers: 99, context_size: Math.min(4096, model.max_context_size ?? 4096) })} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
-                          {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, model)} title="Start studio"><Play size={14} /></button>}
+                          {isLoaded ? <button className="btn-unload-model" onClick={async () => {
+                            await handleUnloadModel(card.loadedModelId);
+                            setModelCards(current => current.map(item => item.id === card.id ? { ...item, loadedModelId: null } : item));
+                          }} disabled={unloadingModelId === card.loadedModelId}><Power size={14} /> Eject</button>
+                          : <button className="btn-load-model" onClick={async () => {
+                            const configuration = { model_path: card.modelPath, gpu_layers: 99, context_size: Math.min(4096, card.max_context_size ?? 4096), mmproj_path: card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || undefined };
+                            const modelId = await handleLoadModel(configuration);
+                            if (modelId) setModelCards(current => current.map(item => item.id === card.id ? { ...item, loadedModelId: modelId } : item));
+                          }} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
+                          {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, card)} title="Start studio"><Play size={14} /></button>}
                         </div>
                       </div>
                     );
                   })}
-                  {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No GGUF models found in AIATM’s models folder.</p>}
+                  {modelCards.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No model cards yet. Click "Add Model" to add one from the catalog.</p>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showModelPicker && (
+            <div className="modal-backdrop" onClick={() => setShowModelPicker(false)}>
+              <div className="modal-container" onClick={e => e.stopPropagation()}>
+                <div className="modal-header">
+                  <h3>Add a model</h3>
+                  <button className="config-sidebar-close" onClick={() => setShowModelPicker(false)} title="Close">
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="modal-body">
+                  <input
+                    type="text"
+                    className="control-input"
+                    placeholder="Search models..."
+                    value={modelPickerSearch}
+                    onChange={e => setModelPickerSearch(e.target.value)}
+                    autoFocus
+                  />
+                  <div className="modal-list">
+                    {detectedModels
+                      .filter(model => model.name.toLowerCase().includes(modelPickerSearch.toLowerCase()))
+                      .map(model => (
+                        <button
+                          key={model.path}
+                          className="modal-list-item"
+                          onClick={() => {
+                            setModelCards(current => [...current, {
+                              id: crypto.randomUUID(),
+                              modelPath: model.path,
+                              name: model.name,
+                              modality: model.modality,
+                              size_bytes: model.size_bytes,
+                              max_context_size: model.max_context_size ?? null,
+                              image_input_available: model.image_input_available === true,
+                              mmproj_path: model.mmproj_path || null,
+                            }]);
+                            setShowModelPicker(false);
+                            setModelPickerSearch('');
+                          }}
+                        >
+                          <strong>{model.name}</strong>
+                          <span className="modal-list-item-meta">{model.modality?.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</span>
+                        </button>
+                      ))}
+                    {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No GGUF models found in AIATM's models folder.</p>}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1343,6 +1434,25 @@ export default function App() {
                 <input className="control-input" value={configTarget?.model_path || ''} onChange={e => setConfigTarget(current => ({ ...current, model_path: e.target.value }))} />
               </div>
               <div className="sidebar-section">
+                <label className="section-label">Vision projector (mmproj)</label>
+                <div className="mmproj-row">
+                  <input className="control-input" value={configTarget?.mmproj_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mmproj_path: e.target.value }))} />
+                  <button className="btn-browse" onClick={() => mmprojInputRef.current?.click()}>Browse</button>
+                  <input
+                    ref={mmprojInputRef}
+                    type="file"
+                    accept=".gguf"
+                    style={{ display: 'none' }}
+                    onChange={e => {
+                      const file = e.target.files[0];
+                      if (file) setConfigTarget(current => ({ ...current, mmproj_path: file.path || '' }));
+                      e.target.value = '';
+                    }}
+                  />
+                </div>
+                <div className="slider-hint">Auto-detected from model directory. Leave empty if not a vision model.</div>
+              </div>
+              <div className="sidebar-section">
                 <div className="slider-header"><label className="section-label">GPU layers</label><span className="badge-value">{configTarget?.gpu_layers ?? 99}</span></div>
                 <input className="control-slider" type="range" min="0" max="99" value={configTarget?.gpu_layers ?? 99} onChange={e => setConfigTarget(current => ({ ...current, gpu_layers: Number(e.target.value) }))} />
               </div>
@@ -1365,7 +1475,7 @@ export default function App() {
                 <div className="preview-title"><Cpu size={13} /> Estimated VRAM</div>
                 <strong>{((modelFitPreview?.total_required_vram_bytes || 0) / 1e9).toFixed(2)} GB</strong>
               </div>
-              <button className="btn-load-model config-sidebar-load" onClick={() => handleLoadModel({ model_path: configTarget?.model_path, gpu_layers: configTarget?.gpu_layers ?? 99, context_size: configTarget?.context_size ?? 4096 })} disabled={isLoadingModel}>
+              <button className="btn-load-model config-sidebar-load" onClick={() => handleLoadModel({ model_path: configTarget?.model_path, gpu_layers: configTarget?.gpu_layers ?? 99, context_size: configTarget?.context_size ?? 4096, mmproj_path: configTarget?.mmproj_path || undefined })} disabled={isLoadingModel}>
                 <Zap size={15} /> {isLoadingModel ? 'Loading...' : 'Load configured model'}
               </button>
               <div className="config-sidebar-section-title">Loaded models ({loadedModels.length})</div>
