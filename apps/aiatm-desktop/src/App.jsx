@@ -121,6 +121,35 @@ function AttachmentPreview({ attachment }) {
   return <a className="chat-attachment-file" href={attachment.dataUrl} download={attachment.name}>{attachment.name}</a>;
 }
 
+const HF_MODEL_TYPES = [
+  { label: 'Text Generation', tag: 'text-generation' },
+  { label: 'Text-to-Text', tag: 'text2text-generation' },
+  { label: 'Conversational', tag: 'conversational' },
+  { label: 'Question Answering', tag: 'question-answering' },
+  { label: 'Summarization', tag: 'summarization' },
+  { label: 'Translation', tag: 'translation' },
+  { label: 'Fill Mask', tag: 'fill-mask' },
+  { label: 'Feature Extraction', tag: 'feature-extraction' },
+  { label: 'Image-Text-to-Text', tag: 'image-text-to-text' },
+];
+
+const HF_LANGUAGES = [
+  { label: 'English', tag: 'en' },
+  { label: 'Chinese', tag: 'zh' },
+  { label: 'French', tag: 'fr' },
+  { label: 'German', tag: 'de' },
+  { label: 'Spanish', tag: 'es' },
+  { label: 'Japanese', tag: 'ja' },
+  { label: 'Korean', tag: 'ko' },
+  { label: 'Russian', tag: 'ru' },
+  { label: 'Arabic', tag: 'ar' },
+  { label: 'Portuguese', tag: 'pt' },
+];
+
+const HF_PRECISIONS = [
+  'Q2_K', 'Q3_K_M', 'Q4_0', 'Q4_K_M', 'Q5_K_M', 'Q6_K', 'Q8_0', 'F16',
+].map(tag => ({ label: tag, tag }));
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('models');
   const [modelPath, setModelPath] = useState(
@@ -330,6 +359,7 @@ export default function App() {
   const [hfSearchError, setHfSearchError] = useState(false);
   const [hfSort, setHfSort] = useState('trendingScore');
   const [hfFilters, setHfFilters] = useState([]);
+  const [hfSidebarSections, setHfSidebarSections] = useState({ sort: true, modelType: true, language: false, precision: false });
   const [hfExpandedRepo, setHfExpandedRepo] = useState(null);
   const [hfRepoFiles, setHfRepoFiles] = useState([]);
   const [hfRepoFilesLoading, setHfRepoFilesLoading] = useState(false);
@@ -364,6 +394,10 @@ export default function App() {
 
   const toggleHfFilter = (tag) => {
     setHfFilters(current => current.includes(tag) ? current.filter(t => t !== tag) : [...current, tag]);
+  };
+
+  const toggleHfSidebarSection = (key) => {
+    setHfSidebarSections(current => ({ ...current, [key]: !current[key] }));
   };
 
   const runHfSearch = useCallback((query, sort, filters) => {
@@ -710,7 +744,7 @@ export default function App() {
       syncMessages(prev =>
         prev.map(m =>
           m.id === aiId
-            ? { ...m, content: combined, loading: !done, telemetry: telemetry, truncated: done && finishReason === 'length' }
+            ? { ...m, content: combined, loading: !done, telemetry: telemetry, truncated: done && finishReason === 'length', toolEvents: done ? (m.toolEvents || []).filter(e => e.status !== 'executing') : m.toolEvents }
             : m
         )
       );
@@ -737,20 +771,64 @@ export default function App() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let sseBuffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const text = decoder.decode(value, { stream: true });
-        // SSE lines look like: data: {...json...}\n
-        const lines = text.split('\n');
+        // SSE lines look like: data: {...json...}\n — a read can end mid-line,
+        // so keep the trailing partial in a buffer instead of dropping it.
+        sseBuffer += decoder.decode(value, { stream: true });
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() ?? '';
         for (const line of lines) {
           const raw = line.startsWith('data:') ? line.slice(5).trim() : line.trim();
           if (!raw || raw === '[DONE]') continue;
 
           try {
             const chunk = JSON.parse(raw);
+
+            if (chunk.type === 'tool_status') {
+              syncMessages(prev => prev.map(m =>
+                m.id === aiId
+                  ? { ...m, toolEvents: [...(m.toolEvents || []), { name: chunk.tool_name, status: 'executing' }] }
+                  : m
+              ));
+              continue;
+            }
+
+            if (chunk.type === 'tool_result') {
+              const mediaResult = chunk.media_url ? {
+                url: `http://127.0.0.1:8080${chunk.media_url}`,
+                type: chunk.media_type || 'application/octet-stream',
+                content: chunk.content || '',
+              } : null;
+
+              syncMessages(prev => prev.map(m => {
+                if (m.id !== aiId) return m;
+                // Close out the matching in-flight call rather than appending a
+                // second entry — one tool_status pairs with one tool_result.
+                const events = [...(m.toolEvents || [])];
+                const idx = events.map(e => e.status).lastIndexOf('executing');
+                const resolved = {
+                  name: chunk.tool_name,
+                  status: chunk.is_error ? 'error' : 'done',
+                  detail: chunk.is_error ? chunk.content : null,
+                };
+                if (idx >= 0) events[idx] = resolved; else events.push(resolved);
+
+                return {
+                  ...m,
+                  toolEvents: events,
+                  mediaResults: mediaResult
+                    ? [...(m.mediaResults || []), mediaResult]
+                    : m.mediaResults,
+                };
+              }));
+              continue;
+            }
+
             const choice = chunk?.choices?.[0] ?? {};
             const delta = choice.delta ?? {};
             if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -1245,6 +1323,29 @@ export default function App() {
                         {msg.attachments?.length > 0 && <div className="chat-attachments">
                           {msg.attachments.map(attachment => <AttachmentPreview key={attachment.dataUrl} attachment={attachment} />)}
                         </div>}
+                        {msg.toolEvents?.map((event, idx) => (
+                          <div key={idx} className={`tool-status-indicator ${event.status}`}>
+                            {event.status === 'executing' && <Loader size={14} className="spin" />}
+                            <span>
+                              {event.status === 'executing' && `Calling ${event.name}...`}
+                              {event.status === 'done' && `Used tool: ${event.name}`}
+                              {event.status === 'error' && `Tool ${event.name} failed: ${event.detail}`}
+                            </span>
+                          </div>
+                        ))}
+                        {msg.mediaResults?.map((media, idx) => (
+                          <div key={idx} className="tool-media-result">
+                            {media.type?.startsWith('audio/') && (
+                              <audio controls autoPlay src={media.url} style={{ width: '100%' }} />
+                            )}
+                            {media.type?.startsWith('image/') && (
+                              <img src={media.url} alt="Generated" className="tool-media-image" />
+                            )}
+                            {media.type?.startsWith('video/') && (
+                              <video controls src={media.url} style={{ width: '100%', borderRadius: '8px' }} />
+                            )}
+                          </div>
+                        ))}
                         {msg.telemetry && (
                           <div className="meta-info">
                             <span className="tag-speed"><Zap size={11} /> {msg.telemetry}</span>
@@ -1405,36 +1506,99 @@ export default function App() {
                   )}
 
                   {modelPickerTab === 'discover' && (
-                    <>
-                      <div className="hf-search-bar">
-                        <input
-                          type="text"
-                          className="control-input"
-                          placeholder="Search Hugging Face for GGUF models..."
-                          value={hfSearchQuery}
-                          onChange={e => setHfSearchQuery(e.target.value)}
-                          onKeyDown={e => { if (e.key === 'Enter') runHfSearch(hfSearchQuery, hfSort, hfFilters); }}
-                          autoFocus
-                        />
-                        <select className="control-select hf-sort-select" value={hfSort} onChange={e => setHfSort(e.target.value)}>
-                          <option value="trendingScore">Trending</option>
-                          <option value="downloads">Most Downloads</option>
-                          <option value="likes">Most Likes</option>
-                        </select>
-                      </div>
-                      <div className="hf-filter-chips">
-                        {['text-generation', 'text-generation-inference', 'text2text-generation'].map(tag => (
-                          <button
-                            key={tag}
-                            className={`hf-filter-chip ${hfFilters.includes(tag) ? 'active' : ''}`}
-                            onClick={() => toggleHfFilter(tag)}
-                          >
-                            {tag}
+                    <div className="hf-discover-layout">
+                      <div className="hf-sidebar">
+                        <div className="hf-sidebar-top">
+                          <span>Filters{hfFilters.length > 0 ? ` (${hfFilters.length})` : ''}</span>
+                          {hfFilters.length > 0 && (
+                            <button className="hf-clear-filters" onClick={() => setHfFilters([])}>Clear filters</button>
+                          )}
+                        </div>
+
+                        <div className="hf-sidebar-section">
+                          <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('sort')}>
+                            {hfSidebarSections.sort ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            Sort By
                           </button>
-                        ))}
+                          {hfSidebarSections.sort && (
+                            <div className="hf-sidebar-section-body">
+                              <select className="control-select" value={hfSort} onChange={e => setHfSort(e.target.value)}>
+                                <option value="trendingScore">Trending</option>
+                                <option value="downloads">Most Downloads</option>
+                                <option value="likes">Most Likes</option>
+                                <option value="lastModified">Recently Updated</option>
+                                <option value="created">Newest</option>
+                              </select>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="hf-sidebar-section">
+                          <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('modelType')}>
+                            {hfSidebarSections.modelType ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            Model Type
+                          </button>
+                          {hfSidebarSections.modelType && (
+                            <div className="hf-sidebar-section-body hf-checkbox-list">
+                              {HF_MODEL_TYPES.map(({ label, tag }) => (
+                                <label key={tag} className="hf-checkbox-item">
+                                  <input type="checkbox" checked={hfFilters.includes(tag)} onChange={() => toggleHfFilter(tag)} />
+                                  {label}
+                                </label>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="hf-sidebar-section">
+                          <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('language')}>
+                            {hfSidebarSections.language ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            Language
+                          </button>
+                          {hfSidebarSections.language && (
+                            <div className="hf-sidebar-section-body hf-checkbox-list">
+                              {HF_LANGUAGES.map(({ label, tag }) => (
+                                <label key={tag} className="hf-checkbox-item">
+                                  <input type="checkbox" checked={hfFilters.includes(tag)} onChange={() => toggleHfFilter(tag)} />
+                                  {label}
+                                </label>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="hf-sidebar-section">
+                          <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('precision')}>
+                            {hfSidebarSections.precision ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            Precision / Quantization
+                          </button>
+                          {hfSidebarSections.precision && (
+                            <div className="hf-sidebar-section-body hf-checkbox-list">
+                              {HF_PRECISIONS.map(({ label, tag }) => (
+                                <label key={tag} className="hf-checkbox-item">
+                                  <input type="checkbox" checked={hfFilters.includes(tag)} onChange={() => toggleHfFilter(tag)} />
+                                  {label}
+                                </label>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       </div>
 
-                      <div className="modal-list">
+                      <div className="hf-results-panel">
+                        <div className="hf-search-bar">
+                          <input
+                            type="text"
+                            className="control-input"
+                            placeholder="Search Hugging Face for GGUF models..."
+                            value={hfSearchQuery}
+                            onChange={e => setHfSearchQuery(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') runHfSearch(hfSearchQuery, hfSort, hfFilters); }}
+                            autoFocus
+                          />
+                        </div>
+
+                        <div className="modal-list">
                         {hfSearchLoading && (
                           <div className="hf-empty-state">
                             <Loader size={22} className="spin" />
@@ -1500,7 +1664,6 @@ export default function App() {
                                       <div key={file.filename} className="hf-file-row">
                                         <div>
                                           <div>{file.filename}</div>
-                                          <span className="modal-list-item-meta">{formatFileSize(file.size)}</span>
                                           {download && download.status === 'downloading' && (
                                             <div className="hf-progress-bar">
                                               <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
@@ -1510,18 +1673,21 @@ export default function App() {
                                             <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
                                           )}
                                         </div>
-                                        {download && download.status === 'complete' ? (
-                                          <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
-                                        ) : (
-                                          <button
-                                            className="hf-download-btn"
-                                            disabled={download?.status === 'downloading'}
-                                            onClick={() => startHfDownload(repoId, file.filename)}
-                                          >
-                                            {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
-                                            {download?.status === 'downloading' ? 'Downloading' : 'Download'}
-                                          </button>
-                                        )}
+                                        <div className="hf-file-actions">
+                                          {file.size != null && <span className="hf-file-size">{formatFileSize(file.size)}</span>}
+                                          {download && download.status === 'complete' ? (
+                                            <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
+                                          ) : (
+                                            <button
+                                              className="hf-download-btn"
+                                              disabled={download?.status === 'downloading'}
+                                              onClick={() => startHfDownload(repoId, file.filename)}
+                                            >
+                                              {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
+                                              {download?.status === 'downloading' ? 'Downloading' : 'Download'}
+                                            </button>
+                                          )}
+                                        </div>
                                       </div>
                                     );
                                   })}
@@ -1530,8 +1696,9 @@ export default function App() {
                             </div>
                           );
                         })}
+                        </div>
                       </div>
-                    </>
+                    </div>
                   )}
                 </div>
               </div>

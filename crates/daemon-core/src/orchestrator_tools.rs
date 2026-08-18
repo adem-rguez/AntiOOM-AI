@@ -1,0 +1,299 @@
+//! Model-agnostic tools for the orchestrating text model.
+//!
+//! Instead of exposing one bespoke tool per backend (`speak_text`, `generate_image`, …),
+//! these let the orchestrator discover what is on the machine and drive any of it:
+//!
+//!   `list_models` — what exists, what modality it is, whether it is loaded
+//!   `run_model`   — prompt one of them (loading it first if needed) and get the output back
+//!
+//! Both return their result to the orchestrator, which then decides what to do next.
+
+use axum::extract::State;
+use axum::Json;
+use backend_trait::{InferenceRequest, Modality, SamplingParams, ToolCall, ToolResult, ToolSchema};
+use tracing::info;
+
+use crate::http::{list_detected_models, load_model, AppState, ModelLoadRequest};
+
+/// Schemas advertised to the orchestrator alongside the per-backend tools.
+pub fn schemas() -> Vec<ToolSchema> {
+    vec![
+        ToolSchema {
+            name: "list_models".into(),
+            description: "List every model available on this machine, with its modality \
+                          (text, vision, tts, audio, image, video) and whether it is currently \
+                          loaded. Call this first when you need to know what you can run."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "modality": {
+                        "type": "string",
+                        "description": "Optional filter, e.g. 'tts' to list only speech models"
+                    }
+                }
+            }),
+        },
+        ToolSchema {
+            name: "run_model".into(),
+            description: "Send a prompt to one of the models from list_models and return its \
+                          output. The model is loaded automatically if it is not already. Text \
+                          models return text; image, speech and video models return media."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "string",
+                        "description": "Name of the model to run, exactly as given by list_models"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt to send to that model"
+                    }
+                },
+                "required": ["model", "prompt"]
+            }),
+        },
+    ]
+}
+
+/// Handle `tool_call` if it is one of ours. Returns `None` for anything else so the
+/// caller can fall through to the per-backend dispatcher.
+pub async fn dispatch(state: &AppState, tool_call: &ToolCall) -> Option<ToolResult> {
+    match tool_call.name.as_str() {
+        "list_models" => Some(list_models(state, tool_call).await),
+        "run_model" => Some(run_model(state, tool_call).await),
+        _ => None,
+    }
+}
+
+fn arg<'a>(tool_call: &'a ToolCall, key: &str) -> Option<&'a str> {
+    tool_call.arguments.get(key).and_then(|v| v.as_str())
+}
+
+fn ok(tool_call: &ToolCall, content: String) -> ToolResult {
+    ToolResult {
+        tool_call_id: tool_call.id.clone(),
+        content,
+        media_handle: None,
+        media_data: None,
+        media_type: None,
+        is_error: false,
+    }
+}
+
+fn err(tool_call: &ToolCall, content: String) -> ToolResult {
+    ToolResult {
+        tool_call_id: tool_call.id.clone(),
+        content,
+        media_handle: None,
+        media_data: None,
+        media_type: None,
+        is_error: true,
+    }
+}
+
+/// A model as the orchestrator sees it: file name, modality, loaded or not.
+async fn inventory(state: &AppState) -> Vec<serde_json::Value> {
+    let loaded = state.loaded_models.lock().await.clone();
+    let catalog = list_detected_models().await.0;
+
+    let mut rows: Vec<serde_json::Value> = catalog
+        .iter()
+        .map(|entry| {
+            let running = loaded.values().find(|l| paths_match(&l.model_path, &entry.path));
+            serde_json::json!({
+                "model": entry.name,
+                "modality": running.map(|l| l.modality.clone()).unwrap_or_else(|| entry.modality.clone()),
+                "loaded": running.is_some(),
+            })
+        })
+        .collect();
+
+    // Anything loaded from outside the models directory still needs to be listed.
+    for entry in loaded.values() {
+        let name = file_name_of(&entry.model_path);
+        if !rows.iter().any(|r| r["model"] == serde_json::Value::String(name.clone())) {
+            rows.push(serde_json::json!({
+                "model": name,
+                "modality": entry.modality,
+                "loaded": true,
+            }));
+        }
+    }
+    rows
+}
+
+fn file_name_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn paths_match(a: &str, b: &str) -> bool {
+    a.replace('\\', "/").eq_ignore_ascii_case(&b.replace('\\', "/"))
+        || file_name_of(a).eq_ignore_ascii_case(&file_name_of(b))
+}
+
+async fn list_models(state: &AppState, tool_call: &ToolCall) -> ToolResult {
+    let filter = arg(tool_call, "modality").map(|m| m.to_ascii_lowercase());
+    let mut rows = inventory(state).await;
+    if let Some(filter) = &filter {
+        rows.retain(|r| r["modality"].as_str().unwrap_or("").eq_ignore_ascii_case(filter));
+    }
+
+    if rows.is_empty() {
+        return ok(tool_call, "No models are available on this machine.".into());
+    }
+    ok(tool_call, serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+}
+
+async fn run_model(state: &AppState, tool_call: &ToolCall) -> ToolResult {
+    let (Some(target), Some(prompt)) = (arg(tool_call, "model"), arg(tool_call, "prompt")) else {
+        return err(tool_call, "run_model needs both 'model' and 'prompt'.".into());
+    };
+
+    // Resolve against what is already loaded, else load it from the catalog.
+    let mut entry = find_loaded(state, target).await;
+    if entry.is_none() {
+        let catalog = list_detected_models().await.0;
+        let Some(found) = catalog.into_iter().find(|c| {
+            c.name.eq_ignore_ascii_case(target) || paths_match(&c.path, target)
+        }) else {
+            return err(tool_call, format!(
+                "No model named '{}'. Call list_models to see what is available.", target
+            ));
+        };
+        info!("run_model: loading '{}' on demand", found.name);
+        let loaded = load_model(
+            State(state.clone()),
+            Json(ModelLoadRequest {
+                model_path: found.path.clone(),
+                gpu_layers: None,
+                context_size: None,
+                mmproj_path: found.mmproj_path.clone(),
+            }),
+        )
+        .await;
+        match loaded {
+            Ok(Json(l)) => entry = Some(l),
+            Err((_, e)) => return err(tool_call, format!("Failed to load '{}': {}", found.name, e)),
+        }
+    }
+
+    let entry = entry.expect("resolved above");
+    let modality = entry.modality.as_str();
+    info!("run_model: '{}' ({}) <- {:?}", entry.model_path, modality, prompt);
+
+    match modality {
+        "text" | "vision" => run_text_model(state, tool_call, entry.port, prompt).await,
+        _ => run_media_model(state, tool_call, modality, prompt).await,
+    }
+}
+
+async fn find_loaded(state: &AppState, target: &str) -> Option<crate::http::LoadedModelEntry> {
+    let loaded = state.loaded_models.lock().await;
+    loaded
+        .values()
+        .find(|l| l.model_id == target || paths_match(&l.model_path, target))
+        .cloned()
+}
+
+/// Text and vision models are served by llama-server on their own port.
+async fn run_text_model(
+    _state: &AppState,
+    tool_call: &ToolCall,
+    port: u16,
+    prompt: &str,
+) -> ToolResult {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let body = serde_json::json!({
+        "model": "local",
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": 1024,
+        "stream": false,
+    });
+
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+    let response = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return err(tool_call, format!("Could not reach the model on port {}: {}", port, e)),
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return err(tool_call, format!("Model returned HTTP {}: {}", status, text));
+    }
+
+    let json: serde_json::Value = match response.json().await {
+        Ok(j) => j,
+        Err(e) => return err(tool_call, format!("Malformed response from the model: {}", e)),
+    };
+    let text = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if text.is_empty() {
+        return err(tool_call, "The model returned an empty response.".into());
+    }
+    ok(tool_call, text)
+}
+
+/// Everything else goes through its registered backend and may return binary output.
+async fn run_media_model(
+    state: &AppState,
+    tool_call: &ToolCall,
+    modality: &str,
+    prompt: &str,
+) -> ToolResult {
+    let (backend_modality, mime) = match modality {
+        "tts" => (Modality::AudioTts, "audio/wav"),
+        "audio" => (Modality::AudioAsr, "text/plain"),
+        "image" => (Modality::Image, "image/png"),
+        "video" => (Modality::Video, "video/mp4"),
+        other => return err(tool_call, format!("Modality '{}' cannot be run yet.", other)),
+    };
+
+    let Some(backend_arc) = state.registry.get_backend(backend_modality).await else {
+        return err(tool_call, format!("No backend is registered for {:?}.", backend_modality));
+    };
+
+    let request = InferenceRequest {
+        request_id: format!("run_model-{}", uuid::Uuid::new_v4()),
+        prompt: prompt.to_string(),
+        messages: None,
+        sampling: SamplingParams::default(),
+        modality: backend_modality,
+        image_input: None,
+        tools: None,
+        tool_choice: None,
+    };
+
+    let backend = backend_arc.read().await;
+    match tokio::time::timeout(std::time::Duration::from_secs(180), backend.generate(request)).await {
+        Ok(Ok(response)) => {
+            let Some(data) = response.output_data else {
+                return ok(tool_call, response.output_text);
+            };
+            let media_id = state.media_store.store(data, mime).await;
+            ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content: response.output_text,
+                media_handle: Some(format!("/v1/media/{}", media_id)),
+                media_data: None,
+                media_type: Some(mime.to_string()),
+                is_error: false,
+            }
+        }
+        Ok(Err(e)) => err(tool_call, format!("The model failed: {}", e)),
+        Err(_) => err(tool_call, "The model timed out after 180 seconds.".into()),
+    }
+}

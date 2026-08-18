@@ -16,6 +16,20 @@ use base64::Engine;
 /// Ports handed out to spawned `kokoro_tts_server.py` instances.
 static NEXT_TTS_PORT: AtomicU16 = AtomicU16::new(59100);
 
+/// Claim the next port nothing is listening on. The counter restarts at 59100
+/// on every daemon start, so without this probe a new server can collide with
+/// an orphaned one left behind by a previous run.
+fn next_free_tts_port() -> u16 {
+    for _ in 0..64 {
+        let port = NEXT_TTS_PORT.fetch_add(1, Ordering::SeqCst);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        warn!("TTS port {} already in use (orphaned server?), trying the next one", port);
+    }
+    NEXT_TTS_PORT.fetch_add(1, Ordering::SeqCst)
+}
+
 /// How long to wait for the Python server to print "READY" on startup.
 /// Model loading (Kokoro weights + espeak init) can take a while on first run.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -101,6 +115,15 @@ impl Default for TtsBackend {
     }
 }
 
+impl Drop for TtsBackend {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[async_trait]
 impl InferenceBackend for TtsBackend {
     fn name(&self) -> &'static str {
@@ -154,7 +177,7 @@ impl InferenceBackend for TtsBackend {
             let _ = child.wait();
         }
 
-        let port = NEXT_TTS_PORT.fetch_add(1, Ordering::SeqCst);
+        let port = next_free_tts_port();
         let model_path_owned = model_path.to_path_buf();
 
         match tokio::task::spawn_blocking(move || Self::spawn_server(&model_path_owned, port))
@@ -167,8 +190,16 @@ impl InferenceBackend for TtsBackend {
                 self.port = port;
             }
             Err(e) => {
-                warn!("Failed to start kokoro_tts_server.py: {}. Falling back to simulation mode.", e);
+                // The file exists but the server could not serve it (wrong format,
+                // missing dependency, …). Report that instead of quietly serving
+                // placeholder audio that looks like a success.
                 self.process = None;
+                self.is_loaded.store(false, Ordering::SeqCst);
+                return Err(BackendError::LoadError(format!(
+                    "Could not start the TTS server for '{}': {}",
+                    model_path.display(),
+                    e
+                )));
             }
         }
 

@@ -1,6 +1,7 @@
 mod grpc;
 mod http;
 mod media_store;
+mod orchestrator_tools;
 mod profiler;
 mod registry;
 mod session;

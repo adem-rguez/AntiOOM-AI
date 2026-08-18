@@ -28,6 +28,25 @@ import wave
 
 import numpy as np
 
+# Import torch up front: creating the onnxruntime CUDA session loads a cuDNN
+# built against a different CUDA major than torch bundles, after which torch's
+# own cudnn_cnn64_9.dll fails to load (WinError 127). Loading torch first wins.
+try:
+    import torch  # noqa: F401
+except ImportError:
+    pass
+
+if sys.platform == "win32":
+    import importlib.util as _ilu
+    for _mod in ("nvidia.cu13", "nvidia.cudnn"):
+        _spec = _ilu.find_spec(_mod)
+        if _spec and _spec.submodule_search_locations:
+            for _loc in _spec.submodule_search_locations:
+                for _bin in ("bin", os.path.join("bin", "x86_64")):
+                    _p = os.path.join(_loc, _bin)
+                    if os.path.isdir(_p):
+                        os.environ["PATH"] = _p + ";" + os.environ.get("PATH", "")
+                        os.add_dll_directory(_p)
 os.environ["PATH"] = os.environ.get("PATH", "") + r";C:\Program Files\eSpeak NG"
 sys.modules.setdefault("spacy", types.ModuleType("spacy"))
 
@@ -150,7 +169,13 @@ def main():
 
     G2P = EspeakG2P(language="en-us")
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    # Refuse to share a port with an orphaned server from an earlier daemon run —
+    # on Windows SO_REUSEADDR would let the bind succeed and split requests between
+    # the two processes, so requests silently land on the stale one.
+    class ExclusiveHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = False
+
+    server = ExclusiveHTTPServer(("127.0.0.1", args.port), Handler)
     print("READY", flush=True)
     sys.stdout.flush()
 

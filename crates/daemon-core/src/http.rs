@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use crate::registry::BackendRegistry;
 use crate::profiler::{FitEstimationRequest, FitEstimationResult, HardwareProfiler, SystemHardwareInfo};
@@ -15,6 +15,7 @@ use crate::session::{ActiveSession, SessionManager};
 use crate::tool_registry::ToolRegistry;
 use crate::tool_dispatcher::ToolDispatcher;
 use crate::tool_fallback;
+use crate::orchestrator_tools;
 use crate::media_store::MediaStore;
 use backend_trait::{InferenceRequest, Modality, SamplingParams, ToolCall};
 use llama_backend::process_tracker::ChildRegistry;
@@ -43,6 +44,10 @@ pub struct LoadedModelStatus {
 
 /// Shared multi-model registry: model_id -> entry
 pub type ModelRegistry = Arc<tokio::sync::Mutex<HashMap<String, LoadedModelEntry>>>;
+
+/// How many generate -> tool -> generate rounds one user turn may take before
+/// we stop and return whatever the model has produced.
+const MAX_TOOL_HOPS: usize = 4;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1119,6 +1124,17 @@ struct StreamChatRequest {
     pub inner: ChatCompletionRequest,
 }
 
+/// Port of a loaded model that can serve chat completions, falling back to the
+/// legacy default. Speech/image/video models are registered in the same map but
+/// do not run an HTTP chat endpoint.
+fn first_chat_port(models: &HashMap<String, LoadedModelEntry>) -> u16 {
+    models
+        .values()
+        .find(|e| matches!(e.modality.as_str(), "text" | "vision"))
+        .map(|e| e.port)
+        .unwrap_or(50052)
+}
+
 async fn stream_chat_completions(
     State(state): State<AppState>,
     Json(payload): Json<StreamChatRequest>,
@@ -1133,8 +1149,9 @@ async fn stream_chat_completions(
                 .map(|e| e.port)
                 .unwrap_or(50052)
         } else {
-            // Pick first loaded model, or fall back to 50052
-            models.values().next().map(|e| e.port).unwrap_or(50052)
+            // Chat needs a model that speaks /v1/chat/completions. Tool calls can
+            // load speech or image models alongside it, so never route to those.
+            first_chat_port(&models)
         }
     };
 
@@ -1171,15 +1188,23 @@ async fn stream_chat_completions(
     } else {
         None
     };
-    let tools_enabled = payload.enable_tools.unwrap_or(false) || payload.inner.enable_tools.unwrap_or(false);
+    let tools_enabled = payload.enable_tools.unwrap_or(true) && payload.inner.enable_tools.unwrap_or(true);
     let tool_schemas = if tools_enabled {
-        state.tool_registry.get_available_tools(Some(Modality::Text)).await
+        let mut schemas = state.tool_registry.get_available_tools(Some(Modality::Text)).await;
+        schemas.extend(orchestrator_tools::schemas());
+        schemas
     } else {
         vec![]
     };
     let system_content = if !tool_schemas.is_empty() {
         let fallback_prompt = tool_fallback::build_tool_prompt(&tool_schemas);
-        format!("You are a helpful, knowledgeable AI assistant.{}", fallback_prompt)
+        format!(
+            "You are a helpful, knowledgeable AI assistant that also orchestrates the other models \
+             installed on this machine. You can discover what is available and run any of it — \
+             image generation, speech, transcription, video — when the user's request calls for it. \
+             Use tools proactively; don't just describe what you could do, actually do it.{}",
+            fallback_prompt
+        )
     } else {
         "You are a helpful, knowledgeable AI assistant.".to_string()
     };
@@ -1203,72 +1228,258 @@ async fn stream_chat_completions(
         }
     }
 
-    let mut req_body = serde_json::json!({
-        "model": "local",
-        "messages": chat_messages,
-        "max_tokens": payload.inner.max_tokens.unwrap_or(4096),
-        "temperature": payload.inner.temperature.unwrap_or(0.7),
-        "top_p": payload.inner.top_p.unwrap_or(0.9),
-        "repeat_penalty": 1.15,
-        "stream": true,
-        "thinking": true,
-    });
+    let tools_json: Vec<serde_json::Value> = tool_schemas.iter().map(|t| {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            }
+        })
+    }).collect();
 
-    if !tool_schemas.is_empty() {
-        let tools_json: Vec<serde_json::Value> = tool_schemas.iter().map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                }
-            })
-        }).collect();
-        req_body["tools"] = serde_json::Value::Array(tools_json);
-    }
+    let max_tokens = payload.inner.max_tokens.unwrap_or(4096);
+    let temperature = payload.inner.temperature.unwrap_or(0.7);
+    let top_p = payload.inner.top_p.unwrap_or(0.9);
 
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
     let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
     let upstream = client
         .post(&url)
-        .json(&req_body)
+        .json(&stream_request_body(&chat_messages, &tools_json, max_tokens, temperature, top_p))
         .send()
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    let byte_stream = upstream.bytes_stream();
-    let sse_stream = byte_stream.flat_map(|chunk| {
-        match chunk {
-            Ok(buf) => {
+    let last_user_prompt = payload.inner.messages.iter().rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(512);
+
+    let task_state = state.clone();
+    let task_tool_schemas = tool_schemas.clone();
+    tokio::spawn(async move {
+        // The orchestrator loop: generate, run whatever tool the model asked for,
+        // hand the result back, generate again. Ends on a turn that asks for none.
+        let mut messages = chat_messages;
+        let mut pending = Some(upstream);
+
+        for hop in 0..MAX_TOOL_HOPS {
+            let response = match pending.take() {
+                Some(response) => response,
+                None => {
+                    let body = stream_request_body(&messages, &tools_json, max_tokens, temperature, top_p);
+                    match client.post(&url).json(&body).send().await {
+                        Ok(response) => response,
+                        Err(e) => {
+                            tracing::warn!("follow-up generation after tool result failed: {}", e);
+                            break;
+                        }
+                    }
+                }
+            };
+
+            let mut byte_stream = response.bytes_stream();
+            let mut accumulated_content = String::new();
+            let mut accumulated_reasoning = String::new();
+            // Native streaming tool calls, keyed by `index`: (id, name, argument fragments)
+            let mut native_tool_calls: std::collections::BTreeMap<u64, (String, String, String)> =
+                std::collections::BTreeMap::new();
+
+            while let Some(chunk) = byte_stream.next().await {
+                let buf = match chunk {
+                    Ok(buf) => buf,
+                    Err(_) => break,
+                };
                 let text = String::from_utf8_lossy(&buf).to_string();
-                let events: Vec<Result<Event, std::convert::Infallible>> = text
-                    .lines()
-                    .filter(|line| line.starts_with("data:"))
-                    .map(|line| {
-                        let data = line.trim_start_matches("data:").trim();
-                        Ok(Event::default().data(data.to_string()))
-                    })
-                    .collect();
-                stream::iter(events)
+                for line in text.lines() {
+                    if !line.starts_with("data:") {
+                        continue;
+                    }
+                    let data = line.trim_start_matches("data:").trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == "[DONE]" {
+                        // Don't forward the upstream [DONE] — more hops may follow.
+                        // We send our own once the whole exchange is over.
+                        continue;
+                    }
+
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) = json["choices"][0].get("delta") {
+                            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+                                accumulated_content.push_str(c);
+                            }
+                            if let Some(r) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+                                accumulated_reasoning.push_str(r);
+                            }
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+                                for tc in tcs {
+                                    let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                    let slot = native_tool_calls.entry(idx).or_default();
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        slot.0 = id.to_string();
+                                    }
+                                    if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str()) {
+                                        slot.1 = name.to_string();
+                                    }
+                                    if let Some(args) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                                        slot.2.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if tx.send(Ok(Event::default().data(data.to_string()))).await.is_err() {
+                        return;
+                    }
+                }
             }
-            Err(_) => stream::iter(vec![]),
+
+            if !tools_enabled || task_tool_schemas.is_empty() {
+                break;
+            }
+
+            let combined = if !accumulated_reasoning.is_empty() {
+                format!("<think>\n{}\n</think>\n\n{}", accumulated_reasoning, accumulated_content)
+            } else {
+                accumulated_content.clone()
+            };
+
+            // A tool-capable chat template makes llama-server emit structured
+            // `tool_calls` deltas. Those win — the text fallbacks only exist for
+            // templates that can't do that.
+            let native_call = native_tool_calls.values().find(|(_, name, _)| !name.is_empty())
+                .map(|(id, name, args)| ToolCall {
+                    id: if id.is_empty() { format!("native-{}", uuid::Uuid::new_v4()) } else { id.clone() },
+                    name: name.clone(),
+                    arguments: serde_json::from_str(args.trim())
+                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+                });
+
+            let resolved_call = native_call
+                .or_else(|| tool_fallback::parse_tool_calls(&combined).map(|parsed| parsed.tool_call))
+                .or_else(|| {
+                    // Loose intent matching only on the opening turn: once a tool has
+                    // run, the model names it while describing the result, which would
+                    // otherwise re-trigger the same call every hop.
+                    if hop == 0 {
+                        tool_fallback::detect_tool_intent(&combined, &task_tool_schemas, &last_user_prompt)
+                    } else {
+                        None
+                    }
+                });
+
+            let Some(tool_call) = resolved_call else {
+                break;
+            };
+
+            tracing::info!("stream_chat_completions: hop {} calls tool '{}'", hop, tool_call.name);
+
+            let status_event = serde_json::json!({
+                "type": "tool_status",
+                "tool_name": tool_call.name,
+                "status": "executing",
+            });
+            if tx.send(Ok(Event::default().data(status_event.to_string()))).await.is_err() {
+                return;
+            }
+
+            // Orchestrator tools (list_models / run_model) first, then the
+            // per-backend tools like speak_text.
+            let result = match orchestrator_tools::dispatch(&task_state, &tool_call).await {
+                Some(result) => result,
+                None => task_state.tool_dispatcher.dispatch(&tool_call, 0).await,
+            };
+
+            let mut result_event = serde_json::json!({
+                "type": "tool_result",
+                "tool_name": tool_call.name,
+                "content": result.content,
+                "is_error": result.is_error,
+            });
+            if let Some(handle) = &result.media_handle {
+                result_event["media_url"] = serde_json::Value::String(handle.clone());
+            }
+            if let Some(media_type) = &result.media_type {
+                result_event["media_type"] = serde_json::Value::String(media_type.clone());
+            }
+            if tx.send(Ok(Event::default().data(result_event.to_string()))).await.is_err() {
+                return;
+            }
+
+            // Hand the exchange back so the next hop can act on the result.
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": accumulated_content,
+                "tool_calls": [{
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments.to_string(),
+                    }
+                }]
+            }));
+            let mut feedback = result.content.clone();
+            if result.media_handle.is_some() {
+                feedback.push_str(" (the media has already been shown to the user)");
+            }
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": tool_call.name,
+                "content": feedback,
+            }));
         }
+
+        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
     });
 
+    let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// One upstream request body for a single generation turn.
+fn stream_request_body(
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    max_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": "local",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repeat_penalty": 1.15,
+        "stream": true,
+        "thinking": true,
+    });
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools.to_vec());
+    }
+    body
 }
 
 async fn chat_completions(
     State(state): State<AppState>,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Result<Json<ChatCompletionResponse>, (axum::http::StatusCode, String)> {
-    let tools_enabled = payload.enable_tools.unwrap_or(false);
+    let tools_enabled = payload.enable_tools.unwrap_or(true);
 
     // Determine port (same logic as streaming path)
     let port: u16 = {
         let models = state.loaded_models.lock().await;
-        models.values().next().map(|e| e.port).unwrap_or(50052)
+        first_chat_port(&models)
     };
 
     // Auto-load if nothing loaded (backwards compat)
@@ -1293,16 +1504,30 @@ async fn chat_completions(
         None
     };
 
-    let mut chat_messages: Vec<serde_json::Value> = vec![
-        serde_json::json!({"role": "system", "content": "You are a helpful, knowledgeable AI assistant."})
-    ];
-
     // If tools enabled but we want to use prompt-based fallback, append tool instructions to system prompt
     let tool_schemas = if tools_enabled {
-        state.tool_registry.get_available_tools(Some(Modality::Text)).await
+        let mut schemas = state.tool_registry.get_available_tools(Some(Modality::Text)).await;
+        schemas.extend(orchestrator_tools::schemas());
+        schemas
     } else {
         vec![]
     };
+    let system_content = if !tool_schemas.is_empty() {
+        let fallback_prompt = tool_fallback::build_tool_prompt(&tool_schemas);
+        format!(
+            "You are a helpful, knowledgeable AI assistant that also orchestrates the other models \
+             installed on this machine. You can discover what is available and run any of it — \
+             image generation, speech, transcription, video — when the user's request calls for it. \
+             Use tools proactively; don't just describe what you could do, actually do it.{}",
+            fallback_prompt
+        )
+    } else {
+        "You are a helpful, knowledgeable AI assistant.".to_string()
+    };
+
+    let mut chat_messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "system", "content": system_content})
+    ];
 
     for (i, msg) in payload.messages.iter().enumerate() {
         if Some(i) == last_user_idx && has_image {
@@ -1391,7 +1616,10 @@ async fn chat_completions(
                         tc_json["function"]["arguments"].as_str().unwrap_or("{}")
                     ).unwrap_or(serde_json::json!({})),
                 };
-                let result = state.tool_dispatcher.dispatch(&tc, 0).await;
+                let result = match orchestrator_tools::dispatch(&state, &tc).await {
+                    Some(result) => result,
+                    None => state.tool_dispatcher.dispatch(&tc, 0).await,
+                };
                 tool_results.push((tc, result));
             }
 
@@ -1466,8 +1694,23 @@ async fn chat_completions(
 
     // Check prompt-based fallback if native tools weren't used or didn't produce calls
     if tools_enabled && !tool_schemas.is_empty() && native_tool_calls.is_none() {
-        if let Some(parsed) = tool_fallback::parse_tool_calls(&combined_text) {
-            let result = state.tool_dispatcher.dispatch(&parsed.tool_call, 0).await;
+        let last_user_prompt = payload.messages.iter().rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.as_str())
+            .unwrap_or("");
+
+        let resolved_call = tool_fallback::parse_tool_calls(&combined_text)
+            .map(|parsed| (parsed.text_before, parsed.tool_call))
+            .or_else(|| {
+                tool_fallback::detect_tool_intent(&combined_text, &tool_schemas, last_user_prompt)
+                    .map(|tc| (combined_text.clone(), tc))
+            });
+
+        if let Some((text_before, tool_call)) = resolved_call {
+            let result = match orchestrator_tools::dispatch(&state, &tool_call).await {
+                Some(result) => result,
+                None => state.tool_dispatcher.dispatch(&tool_call, 0).await,
+            };
             let tool_content = if let Some(ref handle) = result.media_handle {
                 format!("{}\n[Media available at: {}]", result.content, handle)
             } else {
@@ -1475,10 +1718,10 @@ async fn chat_completions(
             };
 
             // Re-call with tool result appended
-            chat_messages.push(serde_json::json!({"role": "assistant", "content": parsed.text_before}));
+            chat_messages.push(serde_json::json!({"role": "assistant", "content": text_before}));
             chat_messages.push(serde_json::json!({
                 "role": "user",
-                "content": format!("Tool '{}' returned: {}", parsed.tool_call.name, tool_content),
+                "content": format!("Tool '{}' returned: {}", tool_call.name, tool_content),
             }));
 
             let followup_body = serde_json::json!({
@@ -1976,7 +2219,7 @@ fn resolve_models_dir() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|directory| directory.is_dir())
 }
 
-async fn list_detected_models() -> Json<Vec<DetectedModelEntry>> {
+pub(crate) async fn list_detected_models() -> Json<Vec<DetectedModelEntry>> {
     let mut entries = Vec::new();
 
     if let Some(directory) = resolve_models_dir() {
@@ -2314,7 +2557,7 @@ fn new_model_id(port: u16) -> String {
 }
 
 /// Load a model: detect modality and spawn the appropriate backend.
-async fn load_model(
+pub(crate) async fn load_model(
     State(state): State<AppState>,
     Json(payload): Json<ModelLoadRequest>,
 ) -> Result<Json<LoadedModelEntry>, (axum::http::StatusCode, String)> {
@@ -2346,6 +2589,7 @@ async fn load_model(
                 };
                 if let Err(e) = b.load_model(&model_path, &opts).await {
                     tracing::warn!("TTS backend load_model error: {}", e);
+                    return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
                 }
             } else {
                 tracing::warn!("No TTS backend registered; model registered but inference will fail");
@@ -2364,6 +2608,7 @@ async fn load_model(
                 };
                 if let Err(e) = b.load_model(&model_path, &opts).await {
                     tracing::warn!("ASR backend load_model error: {}", e);
+                    return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2380,6 +2625,7 @@ async fn load_model(
                 };
                 if let Err(e) = b.load_model(&model_path, &opts).await {
                     tracing::warn!("Image backend load_model error: {}", e);
+                    return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2396,6 +2642,7 @@ async fn load_model(
                 };
                 if let Err(e) = b.load_model(&model_path, &opts).await {
                     tracing::warn!("Video backend load_model error: {}", e);
+                    return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;

@@ -55,6 +55,32 @@ async function ensureDaemon() {
   throw new Error('Timed out waiting for daemon-core on http://127.0.0.1:8080.');
 }
 
+// --- Kill stale daemon so cargo can overwrite the binary ---
+async function killStaleDaemon() {
+  if (!(await daemonIsReady())) return;
+  console.log('[LAUNCHER] Stopping stale daemon so the binary can be rebuilt...');
+  await new Promise(resolve => {
+    http.get('http://127.0.0.1:8080/shutdown', () => {}).on('error', () => {});
+    setTimeout(resolve, 1500);
+  });
+  if (await daemonIsReady()) {
+    console.log('[LAUNCHER] Daemon still alive, force-killing daemon-core.exe...');
+    try { execSync('taskkill /F /IM daemon-core.exe', { stdio: 'ignore' }); } catch {}
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}
+
+await killStaleDaemon();
+
+// --- Build Rust daemon ---
+console.log('[LAUNCHER] Building daemon-core (release)...');
+try {
+  execSync('cargo build --release --package daemon-core', { cwd: projectRoot, stdio: 'inherit' });
+} catch (e) {
+  console.error('[LAUNCHER] Cargo build failed:', e.message);
+  process.exit(1);
+}
+
 let daemon;
 try {
   daemon = await ensureDaemon();
