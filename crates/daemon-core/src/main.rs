@@ -5,9 +5,7 @@ mod orchestrator_tools;
 mod profiler;
 mod registry;
 mod session;
-mod tool_dispatcher;
 mod tool_fallback;
-mod tool_registry;
 mod vram;
 
 use std::net::SocketAddr;
@@ -25,8 +23,6 @@ use media_store::MediaStore;
 use proto::daemon_service_server::DaemonServiceServer;
 use registry::BackendRegistry;
 use session::SessionManager;
-use tool_dispatcher::ToolDispatcher;
-use tool_registry::ToolRegistry;
 use tracing::{info, warn};
 use vram::VramArbiter;
 
@@ -84,17 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_backend(Box::new(VideoBackend::new())).await;
     info!("Registered backend plugin: Wan Video Runner (Video)");
 
-    // 3.5 Initialize Tool Registry, Media Store, and Tool Dispatcher
-    let tool_registry = Arc::new(ToolRegistry::new());
-    tool_registry.refresh(&registry).await;
-    info!("Tool registry initialized with available backend tools");
-
+    // 3.5 Initialize Media Store
     let media_store = Arc::new(MediaStore::new(1800)); // 30-minute TTL
-    let tool_dispatcher = Arc::new(ToolDispatcher::new(
-        tool_registry.clone(),
-        registry.clone(),
-        media_store.clone(),
-    ));
 
     // 4. Start HTTP OpenAI-compatible server & Dashboard on 0.0.0.0:8080
     let loaded_models = Arc::new(tokio::sync::Mutex::new(HashMap::<String, http::LoadedModelEntry>::new()));
@@ -122,8 +109,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_model,
         children: children.clone(),
         shutdown_signal: shutdown_tx.clone(),
-        tool_registry,
-        tool_dispatcher,
         media_store,
         hf_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };

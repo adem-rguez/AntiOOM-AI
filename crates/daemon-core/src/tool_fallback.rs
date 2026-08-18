@@ -231,9 +231,9 @@ mod tests {
 
     #[test]
     fn fenced_block_still_wins() {
-        let output = "```tool_call\n{\"name\": \"speak_text\", \"arguments\": {\"text\": \"hi\"}}\n```";
+        let output = "```tool_call\n{\"name\": \"run_model\", \"arguments\": {\"text\": \"hi\"}}\n```";
         let parsed = parse_tool_calls(output).expect("should parse");
-        assert_eq!(parsed.tool_call.name, "speak_text");
+        assert_eq!(parsed.tool_call.name, "run_model");
     }
 
     #[test]

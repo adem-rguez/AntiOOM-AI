@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::registry::BackendRegistry;
 use crate::profiler::{FitEstimationRequest, FitEstimationResult, HardwareProfiler, SystemHardwareInfo};
 use crate::session::{ActiveSession, SessionManager};
-use crate::tool_registry::ToolRegistry;
-use crate::tool_dispatcher::ToolDispatcher;
 use crate::tool_fallback;
 use crate::orchestrator_tools;
 use crate::media_store::MediaStore;
@@ -66,8 +64,6 @@ pub struct AppState {
     pub children: Arc<ChildRegistry>,
     /// Broadcast channel for graceful shutdown. Sent by `/shutdown` endpoint.
     pub shutdown_signal: tokio::sync::broadcast::Sender<()>,
-    pub tool_registry: Arc<ToolRegistry>,
-    pub tool_dispatcher: Arc<ToolDispatcher>,
     pub media_store: Arc<MediaStore>,
     /// Tracks in-progress Hugging Face model downloads, keyed by filename.
     pub hf_downloads: Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
@@ -1190,9 +1186,7 @@ async fn stream_chat_completions(
     };
     let tools_enabled = payload.enable_tools.unwrap_or(true) && payload.inner.enable_tools.unwrap_or(true);
     let tool_schemas = if tools_enabled {
-        let mut schemas = state.tool_registry.get_available_tools(Some(Modality::Text)).await;
-        schemas.extend(orchestrator_tools::schemas());
-        schemas
+        orchestrator_tools::schemas()
     } else {
         vec![]
     };
@@ -1391,11 +1385,17 @@ async fn stream_chat_completions(
                 return;
             }
 
-            // Orchestrator tools (list_models / run_model) first, then the
-            // per-backend tools like speak_text.
+            // Dispatch via the orchestrator tools (list_models / run_model).
             let result = match orchestrator_tools::dispatch(&task_state, &tool_call).await {
                 Some(result) => result,
-                None => task_state.tool_dispatcher.dispatch(&tool_call, 0).await,
+                None => backend_trait::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content: format!("Unknown tool: '{}'.", tool_call.name),
+                    media_handle: None,
+                    media_data: None,
+                    media_type: None,
+                    is_error: true,
+                },
             };
 
             let mut result_event = serde_json::json!({
@@ -1506,9 +1506,7 @@ async fn chat_completions(
 
     // If tools enabled but we want to use prompt-based fallback, append tool instructions to system prompt
     let tool_schemas = if tools_enabled {
-        let mut schemas = state.tool_registry.get_available_tools(Some(Modality::Text)).await;
-        schemas.extend(orchestrator_tools::schemas());
-        schemas
+        orchestrator_tools::schemas()
     } else {
         vec![]
     };
@@ -1618,7 +1616,14 @@ async fn chat_completions(
                 };
                 let result = match orchestrator_tools::dispatch(&state, &tc).await {
                     Some(result) => result,
-                    None => state.tool_dispatcher.dispatch(&tc, 0).await,
+                    None => backend_trait::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: format!("Unknown tool: '{}'.", tc.name),
+                        media_handle: None,
+                        media_data: None,
+                        media_type: None,
+                        is_error: true,
+                    },
                 };
                 tool_results.push((tc, result));
             }
@@ -1709,7 +1714,14 @@ async fn chat_completions(
         if let Some((text_before, tool_call)) = resolved_call {
             let result = match orchestrator_tools::dispatch(&state, &tool_call).await {
                 Some(result) => result,
-                None => state.tool_dispatcher.dispatch(&tool_call, 0).await,
+                None => backend_trait::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content: format!("Unknown tool: '{}'.", tool_call.name),
+                    media_handle: None,
+                    media_data: None,
+                    media_type: None,
+                    is_error: true,
+                },
             };
             let tool_content = if let Some(ref handle) = result.media_handle {
                 format!("{}\n[Media available at: {}]", result.content, handle)
@@ -2032,6 +2044,26 @@ fn has_image_projector(path: &std::path::Path) -> bool {
     find_sibling_mmproj(path).is_some()
 }
 
+/// A `.safetensors` model is a text LLM if the sibling `config.json` in the
+/// same directory declares a `ForCausalLM` architecture (vLLM-style
+/// config-driven detection), e.g. `LlamaForCausalLM`, `Qwen2ForCausalLM`.
+fn detect_safetensors_causal_lm(path: &std::path::Path) -> bool {
+    let Some(directory) = path.parent() else { return false };
+    let config_path = directory.join("config.json");
+    let Ok(contents) = std::fs::read_to_string(&config_path) else { return false };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&contents) else { return false };
+    config
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .map(|architectures| {
+            architectures
+                .iter()
+                .filter_map(|a| a.as_str())
+                .any(|a| a.ends_with("ForCausalLM"))
+        })
+        .unwrap_or(false)
+}
+
 fn detect_model_modality(path: &std::path::Path) -> String {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -2047,6 +2079,7 @@ fn detect_model_modality(path: &std::path::Path) -> String {
                 "text".to_string()
             }
         }
+        "safetensors" if detect_safetensors_causal_lm(path) => "text".to_string(),
         "safetensors" | "ckpt" => {
             if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") {
                 "audio".to_string()
@@ -2290,19 +2323,29 @@ struct HfModelResult {
     private: bool,
 }
 
+/// The on-disk model formats this daemon can actually run, without dots, lowercase.
+/// Single source of truth for catalog gating.
+const SUPPORTED_FORMATS: &[&str] = &["gguf", "safetensors"];
+
 async fn hf_search(
     axum::extract::Query(params): axum::extract::Query<HfSearchQuery>,
 ) -> Json<Vec<HfModelResult>> {
-    let mut filter_tags: Vec<String> = vec!["gguf".to_string()];
+    // NOTE: the Hugging Face `filter` param ANDs its tags together, so a single
+    // request seeded with every entry in SUPPORTED_FORMATS would wrongly require
+    // a model to match ALL formats at once (e.g. "gguf AND safetensors" -> no
+    // results). Instead issue one request per supported format (OR semantics)
+    // and merge, deduping by model id and preserving order.
+    let mut extra_tags: Vec<String> = Vec::new();
     if let Some(filter) = &params.filter {
         for tag in filter.split(',') {
             let tag = tag.trim();
-            if !tag.is_empty() && tag != "gguf" {
-                filter_tags.push(tag.to_string());
+            if !tag.is_empty() && !SUPPORTED_FORMATS.contains(&tag) {
+                extra_tags.push(tag.to_string());
             }
         }
     }
     let sort = params.sort.unwrap_or_else(|| "trendingScore".to_string());
+    let limit = 20usize;
 
     let client = match reqwest::Client::builder()
         .user_agent("antioom-ai/0.1")
@@ -2312,36 +2355,57 @@ async fn hf_search(
         Err(_) => return Json(Vec::new()),
     };
 
-    let mut request = client
-        .get("https://huggingface.co/api/models")
-        .query(&[("limit", "20"), ("sort", sort.as_str())])
-        .query(&[("filter", filter_tags.join(","))]);
+    let mut merged: Vec<HfModelResult> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    if let Some(q) = params.q.as_ref().filter(|q| !q.is_empty()) {
-        request = request.query(&[("search", q.as_str())]);
-    }
-
-    let response = match request.send().await {
-        Ok(resp) => resp,
-        Err(err) => {
-            tracing::warn!("hf-search request failed: {err}");
-            return Json(Vec::new());
+    for format in SUPPORTED_FORMATS {
+        if merged.len() >= limit {
+            break;
         }
-    };
+        let mut filter_tags = vec![format.to_string()];
+        filter_tags.extend(extra_tags.iter().cloned());
 
-    if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        tracing::warn!("hf-search returned error: {body}");
-        return Json(Vec::new());
-    }
+        let mut request = client
+            .get("https://huggingface.co/api/models")
+            .query(&[("limit", limit.to_string().as_str()), ("sort", sort.as_str())])
+            .query(&[("filter", filter_tags.join(","))]);
 
-    match response.json::<Vec<HfModelResult>>().await {
-        Ok(results) => Json(results),
-        Err(err) => {
-            tracing::warn!("hf-search parse failed: {err}");
-            Json(Vec::new())
+        if let Some(q) = params.q.as_ref().filter(|q| !q.is_empty()) {
+            request = request.query(&[("search", q.as_str())]);
+        }
+
+        let response = match request.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!("hf-search request failed for format '{format}': {err}");
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!("hf-search returned error for format '{format}': {body}");
+            continue;
+        }
+
+        match response.json::<Vec<HfModelResult>>().await {
+            Ok(results) => {
+                for result in results {
+                    if merged.len() >= limit {
+                        break;
+                    }
+                    if seen_ids.insert(result.id.clone()) {
+                        merged.push(result);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("hf-search parse failed for format '{format}': {err}");
+            }
         }
     }
+
+    Json(merged)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2395,10 +2459,29 @@ async fn hf_files(
         }
     };
 
+    // Auxiliary files a safetensors repo needs alongside its weight shards to
+    // actually be loadable by `transformers.AutoModelForCausalLM.from_pretrained`.
+    const SAFETENSORS_AUX_FILES: &[&str] = &[
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+    ];
+
     let files = info
         .siblings
         .into_iter()
-        .filter(|s| s.rfilename.ends_with(".gguf"))
+        .filter(|s| {
+            let name = s.rfilename.to_lowercase();
+            let base_name = name.rsplit('/').next().unwrap_or(&name);
+            name.ends_with(".gguf")
+                || name.ends_with(".safetensors")
+                || SAFETENSORS_AUX_FILES.contains(&base_name)
+        })
         .map(|s| HfFileEntry {
             filename: s.rfilename,
             size: s.size,
@@ -2426,7 +2509,11 @@ async fn hf_download(
 ) -> Json<HfDownloadResponse> {
     let models_dir = resolve_models_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("models"));
-    let save_path = models_dir.join(&payload.filename);
+    // Save each repo's files into its own subfolder so config.json/tokenizer.json
+    // from different models don't collide in the shared models/ root.
+    let save_path = models_dir
+        .join(sanitize_repo_id(&payload.repo))
+        .join(&payload.filename);
     let save_path_string = save_path.to_string_lossy().to_string();
 
     {
@@ -2463,6 +2550,16 @@ async fn hf_download(
         status: "downloading",
         path: save_path_string,
     })
+}
+
+/// Turn a HuggingFace repo id (`org/model`) into a filesystem-safe folder name.
+fn sanitize_repo_id(repo: &str) -> String {
+    repo.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect()
 }
 
 async fn run_hf_download(
@@ -2554,6 +2651,84 @@ fn new_model_id(port: u16) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
     format!("mdl-{}-{}", ts, port)
+}
+
+/// How long to wait for `hf_transformers_server.py` to print "READY" on
+/// startup. Loading a safetensors model with `transformers` (weight
+/// deserialization + CUDA transfer) can take a while on first run.
+const HF_TRANSFORMERS_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Spawn `scripts/hf_transformers_server.py` against the model's parent
+/// directory (what `from_pretrained` expects) and block on a worker thread
+/// until it prints "READY" on stdout or the startup timeout elapses. Mirrors
+/// the READY handshake in `tts-backend::TtsBackend::spawn_server`.
+async fn spawn_hf_transformers_server(
+    model_path: &std::path::Path,
+    port: u16,
+) -> Result<std::process::Child, String> {
+    let script_path = std::path::PathBuf::from("scripts").join("hf_transformers_server.py");
+    if !script_path.exists() {
+        return Err(format!(
+            "hf_transformers_server.py not found at: {}",
+            script_path.display()
+        ));
+    }
+    let model_dir = model_path
+        .parent()
+        .ok_or_else(|| format!("Model path '{}' has no parent directory", model_path.display()))?
+        .to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let mut cmd = Command::new("python");
+        cmd.arg(&script_path)
+            .arg("--model-path")
+            .arg(&model_dir)
+            .arg("--port")
+            .arg(port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn hf_transformers_server.py: {}", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture stdout of hf_transformers_server.py".to_string())?;
+
+        let start = Instant::now();
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = child.wait();
+                    return Err("hf_transformers_server.py exited before signalling READY".to_string());
+                }
+                Ok(_) => {
+                    if line.trim() == "READY" {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Error reading hf_transformers_server.py stdout: {}", e));
+                }
+            }
+            if start.elapsed() > HF_TRANSFORMERS_STARTUP_TIMEOUT {
+                let _ = child.kill();
+                return Err("Timed out waiting for hf_transformers_server.py to start".to_string());
+            }
+        }
+
+        Ok(child)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking join error: {}", e))?
 }
 
 /// Load a model: detect modality and spawn the appropriate backend.
@@ -2648,8 +2823,31 @@ pub(crate) async fn load_model(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         _ => {
-            // text / vision / unknown — use llama-server
-            if let Some(server_bin) = find_llama_server_binary() {
+            let is_safetensors = model_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("safetensors"))
+                .unwrap_or(false);
+
+            if is_safetensors {
+                // Config-detected CausalLM safetensors model — spawn the
+                // transformers-backed OpenAI-compatible server instead of
+                // llama-server. It speaks the same /v1/chat/completions
+                // contract, so the existing chat proxy needs no changes.
+                match spawn_hf_transformers_server(&model_path, port).await {
+                    Ok(child) => {
+                        state.children.register(model_id.clone(), child);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to start hf_transformers_server.py for '{}': {}",
+                            model_path.display(),
+                            e
+                        );
+                        return Err((axum::http::StatusCode::BAD_REQUEST, e));
+                    }
+                }
+            } else if let Some(server_bin) = find_llama_server_binary() {
                 let mut child_cmd = std::process::Command::new(&server_bin);
                 child_cmd
                     .arg("-m").arg(&model_path)
@@ -2721,8 +2919,6 @@ pub(crate) async fn load_model(
         };
     }
 
-    state.tool_registry.refresh(&state.registry).await;
-
     Ok(Json(entry))
 }
 
@@ -2780,8 +2976,6 @@ async fn unload_model(
             *status = LoadedModelStatus { is_loaded: false, model_path: None, gpu_layers: None, context_size: None };
         }
     }
-
-    state.tool_registry.refresh(&state.registry).await;
 
     let models = state.loaded_models.lock().await;
     Ok(Json(models.values().cloned().collect()))

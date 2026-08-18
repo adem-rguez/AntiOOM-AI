@@ -209,6 +209,4 @@ pub trait InferenceBackend: Send + Sync {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceStream, BackendError>;
-
-    fn as_tool_schema(&self) -> Option<ToolSchema> { None }
 }

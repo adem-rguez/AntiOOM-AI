@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use backend_trait::{
     BackendError, InferenceBackend, InferenceChunk, InferenceRequest, InferenceResponse,
-    InferenceStream, LoadOptions, Modality, ToolSchema, VramEstimate,
+    InferenceStream, LoadOptions, Modality, VramEstimate,
 };
 use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,20 +136,5 @@ impl InferenceBackend for VideoBackend {
         })];
 
         Ok(Box::pin(stream::iter(chunks)))
-    }
-
-    fn as_tool_schema(&self) -> Option<ToolSchema> {
-        Some(ToolSchema {
-            name: "generate_video".into(),
-            description: "Generate a short video from a text description. Returns video data.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string", "description": "Description of the video to generate"},
-                    "duration_seconds": {"type": "number", "description": "Duration in seconds (1-10)", "default": 4}
-                },
-                "required": ["prompt"]
-            }),
-        })
     }
 }

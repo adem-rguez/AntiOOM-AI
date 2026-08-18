@@ -1,7 +1,6 @@
 //! Model-agnostic tools for the orchestrating text model.
 //!
-//! Instead of exposing one bespoke tool per backend (`speak_text`, `generate_image`, …),
-//! these let the orchestrator discover what is on the machine and drive any of it:
+//! These let the orchestrator discover what is on the machine and drive any of it:
 //!
 //!   `list_models` — what exists, what modality it is, whether it is loaded
 //!   `run_model`   — prompt one of them (loading it first if needed) and get the output back
@@ -15,7 +14,7 @@ use tracing::info;
 
 use crate::http::{list_detected_models, load_model, AppState, ModelLoadRequest};
 
-/// Schemas advertised to the orchestrator alongside the per-backend tools.
+/// Schemas advertised to the orchestrator.
 pub fn schemas() -> Vec<ToolSchema> {
     vec![
         ToolSchema {

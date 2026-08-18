@@ -121,16 +121,70 @@ function AttachmentPreview({ attachment }) {
   return <a className="chat-attachment-file" href={attachment.dataUrl} download={attachment.name}>{attachment.name}</a>;
 }
 
-const HF_MODEL_TYPES = [
-  { label: 'Text Generation', tag: 'text-generation' },
-  { label: 'Text-to-Text', tag: 'text2text-generation' },
-  { label: 'Conversational', tag: 'conversational' },
-  { label: 'Question Answering', tag: 'question-answering' },
-  { label: 'Summarization', tag: 'summarization' },
-  { label: 'Translation', tag: 'translation' },
-  { label: 'Fill Mask', tag: 'fill-mask' },
-  { label: 'Feature Extraction', tag: 'feature-extraction' },
-  { label: 'Image-Text-to-Text', tag: 'image-text-to-text' },
+const HF_MODEL_TYPE_GROUPS = [
+  { group: 'Multimodal', types: [
+    { label: 'Audio-Text-to-Text', tag: 'audio-text-to-text' },
+    { label: 'Image-Text-to-Text', tag: 'image-text-to-text' },
+    { label: 'Visual Question Answering', tag: 'visual-question-answering' },
+    { label: 'Document Question Answering', tag: 'document-question-answering' },
+    { label: 'Video-Text-to-Text', tag: 'video-text-to-text' },
+    { label: 'Visual Document Retrieval', tag: 'visual-document-retrieval' },
+    { label: 'Any-to-Any', tag: 'any-to-any' },
+  ]},
+  { group: 'Computer Vision', types: [
+    { label: 'Depth Estimation', tag: 'depth-estimation' },
+    { label: 'Image Classification', tag: 'image-classification' },
+    { label: 'Object Detection', tag: 'object-detection' },
+    { label: 'Image Segmentation', tag: 'image-segmentation' },
+    { label: 'Text-to-Image', tag: 'text-to-image' },
+    { label: 'Image-to-Text', tag: 'image-to-text' },
+    { label: 'Image-to-Image', tag: 'image-to-image' },
+    { label: 'Image-to-Video', tag: 'image-to-video' },
+    { label: 'Unconditional Image Generation', tag: 'unconditional-image-generation' },
+    { label: 'Video Classification', tag: 'video-classification' },
+    { label: 'Text-to-Video', tag: 'text-to-video' },
+    { label: 'Zero-Shot Image Classification', tag: 'zero-shot-image-classification' },
+    { label: 'Mask Generation', tag: 'mask-generation' },
+    { label: 'Zero-Shot Object Detection', tag: 'zero-shot-object-detection' },
+    { label: 'Text-to-3D', tag: 'text-to-3d' },
+    { label: 'Image-to-3D', tag: 'image-to-3d' },
+    { label: 'Image Feature Extraction', tag: 'image-feature-extraction' },
+    { label: 'Keypoint Detection', tag: 'keypoint-detection' },
+  ]},
+  { group: 'Natural Language Processing', types: [
+    { label: 'Text Classification', tag: 'text-classification' },
+    { label: 'Token Classification', tag: 'token-classification' },
+    { label: 'Table Question Answering', tag: 'table-question-answering' },
+    { label: 'Question Answering', tag: 'question-answering' },
+    { label: 'Zero-Shot Classification', tag: 'zero-shot-classification' },
+    { label: 'Translation', tag: 'translation' },
+    { label: 'Summarization', tag: 'summarization' },
+    { label: 'Feature Extraction', tag: 'feature-extraction' },
+    { label: 'Text Generation', tag: 'text-generation' },
+    { label: 'Text-to-Text Generation', tag: 'text2text-generation' },
+    { label: 'Fill-Mask', tag: 'fill-mask' },
+    { label: 'Sentence Similarity', tag: 'sentence-similarity' },
+  ]},
+  { group: 'Audio', types: [
+    { label: 'Text-to-Speech', tag: 'text-to-speech' },
+    { label: 'Text-to-Audio', tag: 'text-to-audio' },
+    { label: 'Automatic Speech Recognition', tag: 'automatic-speech-recognition' },
+    { label: 'Audio-to-Audio', tag: 'audio-to-audio' },
+    { label: 'Audio Classification', tag: 'audio-classification' },
+    { label: 'Voice Activity Detection', tag: 'voice-activity-detection' },
+  ]},
+  { group: 'Tabular', types: [
+    { label: 'Tabular Classification', tag: 'tabular-classification' },
+    { label: 'Tabular Regression', tag: 'tabular-regression' },
+    { label: 'Time Series Forecasting', tag: 'time-series-forecasting' },
+  ]},
+  { group: 'Reinforcement Learning', types: [
+    { label: 'Reinforcement Learning', tag: 'reinforcement-learning' },
+    { label: 'Robotics', tag: 'robotics' },
+  ]},
+  { group: 'Other', types: [
+    { label: 'Graph Machine Learning', tag: 'graph-machine-learning' },
+  ]},
 ];
 
 const HF_LANGUAGES = [
@@ -451,6 +505,13 @@ export default function App() {
       body: JSON.stringify({ repo: repoId, filename }),
     }).catch(() => {
       setHfDownloads(current => ({ ...current, [filename]: { ...current[filename], status: 'error' } }));
+    });
+  };
+
+  const startHfDownloadAll = (repoId) => {
+    hfRepoFiles.forEach(file => {
+      if (hfDownloads[file.filename]?.status === 'complete') return;
+      startHfDownload(repoId, file.filename);
     });
   };
 
@@ -1540,11 +1601,16 @@ export default function App() {
                           </button>
                           {hfSidebarSections.modelType && (
                             <div className="hf-sidebar-section-body hf-checkbox-list">
-                              {HF_MODEL_TYPES.map(({ label, tag }) => (
-                                <label key={tag} className="hf-checkbox-item">
-                                  <input type="checkbox" checked={hfFilters.includes(tag)} onChange={() => toggleHfFilter(tag)} />
-                                  {label}
-                                </label>
+                              {HF_MODEL_TYPE_GROUPS.map(({ group, types }) => (
+                                <React.Fragment key={group}>
+                                  <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)', marginTop: '8px', marginBottom: '2px' }}>{group}</div>
+                                  {types.map(({ label, tag }) => (
+                                    <label key={tag} className="hf-checkbox-item">
+                                      <input type="checkbox" checked={hfFilters.includes(tag)} onChange={() => toggleHfFilter(tag)} />
+                                      {label}
+                                    </label>
+                                  ))}
+                                </React.Fragment>
                               ))}
                             </div>
                           )}
@@ -1653,7 +1719,15 @@ export default function App() {
                                     </div>
                                   )}
                                   {!hfRepoFilesLoading && hfRepoFiles.length === 0 && (
-                                    <p className="modal-list-item-meta">No GGUF files found in this repo.</p>
+                                    <p className="modal-list-item-meta">No downloadable files found in this repo.</p>
+                                  )}
+                                  {!hfRepoFilesLoading && hfRepoFiles.length > 0 && (
+                                    <div className="hf-file-row hf-file-row-all">
+                                      <div className="modal-list-item-meta">Download every file into a per-model folder</div>
+                                      <button className="hf-download-btn" onClick={() => startHfDownloadAll(repoId)}>
+                                        <Download size={14} /> Download all files
+                                      </button>
+                                    </div>
                                   )}
                                   {!hfRepoFilesLoading && hfRepoFiles.map(file => {
                                     const download = hfDownloads[file.filename];
