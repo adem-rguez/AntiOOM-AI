@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering as AtomicOrdering};
 use axum::{
     extract::State,
     response::{Html, sse::{Event, KeepAlive, Sse}},
@@ -67,6 +67,8 @@ pub struct AppState {
     pub media_store: Arc<MediaStore>,
     /// Tracks in-progress Hugging Face model downloads, keyed by filename.
     pub hf_downloads: Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
+    /// Cancellation flags for in-progress Hugging Face downloads, keyed by filename.
+    pub hf_cancel: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +211,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/model/hf-files", get(hf_files))
         .route("/v1/model/hf-download", post(hf_download))
         .route("/v1/model/hf-download/status", get(hf_download_status))
+        .route("/v1/model/hf-download/cancel", post(hf_download_cancel))
         .with_state(state)
 }
 
@@ -2075,6 +2078,14 @@ fn detect_model_modality(path: &std::path::Path) -> String {
                 .and_then(|mut file| file.by_ref().take(2 * 1024 * 1024).read_to_end(&mut bytes));
             if bytes.windows(b"image-text-to-text".len()).any(|window| window == b"image-text-to-text") {
                 "vision".to_string()
+            } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") || file_name.contains("piper") {
+                "tts".to_string()
+            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
+                "audio".to_string()
+            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") {
+                "image".to_string()
+            } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
+                "video".to_string()
             } else {
                 "text".to_string()
             }
@@ -2303,6 +2314,13 @@ struct HfSearchQuery {
     q: Option<String>,
     sort: Option<String>,
     filter: Option<String>,
+    min_params: Option<u64>,
+    max_params: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfExpandTotal {
+    total: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -2321,6 +2339,12 @@ struct HfModelResult {
     last_modified: Option<String>,
     #[serde(default)]
     private: bool,
+    #[serde(skip_deserializing)]
+    params: Option<u64>,
+    #[serde(default, skip_serializing)]
+    safetensors: Option<HfExpandTotal>,
+    #[serde(default, skip_serializing)]
+    gguf: Option<HfExpandTotal>,
 }
 
 /// The on-disk model formats this daemon can actually run, without dots, lowercase.
@@ -2335,17 +2359,33 @@ async fn hf_search(
     // a model to match ALL formats at once (e.g. "gguf AND safetensors" -> no
     // results). Instead issue one request per supported format (OR semantics)
     // and merge, deduping by model id and preserving order.
+    let mut format_tags: Vec<&str> = Vec::new();
     let mut extra_tags: Vec<String> = Vec::new();
     if let Some(filter) = &params.filter {
         for tag in filter.split(',') {
             let tag = tag.trim();
-            if !tag.is_empty() && !SUPPORTED_FORMATS.contains(&tag) {
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(&format) = SUPPORTED_FORMATS.iter().find(|f| **f == tag) {
+                if !format_tags.contains(&format) {
+                    format_tags.push(format);
+                }
+            } else {
                 extra_tags.push(tag.to_string());
             }
         }
     }
+    let formats: &[&str] = if format_tags.is_empty() {
+        SUPPORTED_FORMATS
+    } else {
+        &format_tags
+    };
     let sort = params.sort.unwrap_or_else(|| "trendingScore".to_string());
-    let limit = 20usize;
+    // With no search term the panel is in "browse" mode, so surface a fuller top
+    // list; a real query narrows things down and 20 keeps it snappy.
+    let has_query = params.q.as_ref().is_some_and(|q| !q.is_empty());
+    let limit = if has_query { 20usize } else { 50usize };
 
     let client = match reqwest::Client::builder()
         .user_agent("antioom-ai/0.1")
@@ -2358,7 +2398,7 @@ async fn hf_search(
     let mut merged: Vec<HfModelResult> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for format in SUPPORTED_FORMATS {
+    for format in formats {
         if merged.len() >= limit {
             break;
         }
@@ -2368,7 +2408,8 @@ async fn hf_search(
         let mut request = client
             .get("https://huggingface.co/api/models")
             .query(&[("limit", limit.to_string().as_str()), ("sort", sort.as_str())])
-            .query(&[("filter", filter_tags.join(","))]);
+            .query(&[("filter", filter_tags.join(","))])
+            .query(&[("expand[]", "safetensors"), ("expand[]", "gguf")]);
 
         if let Some(q) = params.q.as_ref().filter(|q| !q.is_empty()) {
             request = request.query(&[("search", q.as_str())]);
@@ -2390,10 +2431,15 @@ async fn hf_search(
 
         match response.json::<Vec<HfModelResult>>().await {
             Ok(results) => {
-                for result in results {
+                for mut result in results {
                     if merged.len() >= limit {
                         break;
                     }
+                    result.params = result
+                        .safetensors
+                        .as_ref()
+                        .and_then(|s| s.total)
+                        .or_else(|| result.gguf.as_ref().and_then(|g| g.total));
                     if seen_ids.insert(result.id.clone()) {
                         merged.push(result);
                     }
@@ -2403,6 +2449,16 @@ async fn hf_search(
                 tracing::warn!("hf-search parse failed for format '{format}': {err}");
             }
         }
+    }
+
+    if params.min_params.is_some() || params.max_params.is_some() {
+        merged.retain(|result| match result.params {
+            Some(p) => {
+                params.min_params.map_or(true, |m| p >= m)
+                    && params.max_params.map_or(true, |m| p <= m)
+            }
+            None => false,
+        });
     }
 
     Json(merged)
@@ -2423,6 +2479,20 @@ struct HfSibling {
 struct HfRepoInfo {
     #[serde(default)]
     siblings: Vec<HfSibling>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfTreeLfs {
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfTreeEntry {
+    path: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    lfs: Option<HfTreeLfs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2459,6 +2529,33 @@ async fn hf_files(
         }
     };
 
+    // The siblings array above leaves `size` = None for large LFS files
+    // (.gguf/.safetensors). The tree API reports the real byte size in
+    // `lfs.size` for LFS-tracked files, so fetch it and use it to fill in
+    // accurate sizes. Fall back to the siblings-based size if this fails.
+    let tree_url = format!(
+        "https://huggingface.co/api/models/{}/tree/main?recursive=true&expand=1",
+        params.repo
+    );
+    let mut tree_sizes: HashMap<String, u64> = HashMap::new();
+    match client.get(&tree_url).send().await {
+        Ok(resp) => match resp.json::<Vec<HfTreeEntry>>().await {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Some(size) = entry.lfs.map(|lfs| lfs.size).or(entry.size) {
+                        tree_sizes.insert(entry.path, size);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("hf-files tree parse failed: {err}");
+            }
+        },
+        Err(err) => {
+            tracing::warn!("hf-files tree request failed: {err}");
+        }
+    }
+
     // Auxiliary files a safetensors repo needs alongside its weight shards to
     // actually be loadable by `transformers.AutoModelForCausalLM.from_pretrained`.
     const SAFETENSORS_AUX_FILES: &[&str] = &[
@@ -2482,9 +2579,12 @@ async fn hf_files(
                 || name.ends_with(".safetensors")
                 || SAFETENSORS_AUX_FILES.contains(&base_name)
         })
-        .map(|s| HfFileEntry {
-            filename: s.rfilename,
-            size: s.size,
+        .map(|s| {
+            let size = tree_sizes.get(&s.rfilename).copied().or(s.size);
+            HfFileEntry {
+                filename: s.rfilename,
+                size,
+            }
         })
         .collect();
 
@@ -2530,13 +2630,19 @@ async fn hf_download(
         );
     }
 
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut cancel_map = state.hf_cancel.lock().await;
+        cancel_map.insert(payload.filename.clone(), cancel_flag.clone());
+    }
+
     let downloads_map = state.hf_downloads.clone();
     let repo = payload.repo.clone();
     let filename = payload.filename.clone();
     let target_path = save_path.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = run_hf_download(&repo, &filename, &target_path, &downloads_map).await {
+        if let Err(err) = run_hf_download(&repo, &filename, &target_path, &downloads_map, &cancel_flag).await {
             tracing::warn!("hf-download failed for {filename}: {err}");
             let mut downloads = downloads_map.lock().await;
             if let Some(entry) = downloads.get_mut(&filename) {
@@ -2567,6 +2673,7 @@ async fn run_hf_download(
     filename: &str,
     target_path: &std::path::Path,
     downloads_map: &Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
+    cancel_flag: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -2579,6 +2686,7 @@ async fn run_hf_download(
 
     let client = reqwest::Client::builder()
         .user_agent("antioom-ai/0.1")
+        .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -2599,25 +2707,42 @@ async fn run_hf_download(
         }
     }
 
-    let mut file = tokio::fs::File::create(target_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut file = tokio::io::BufWriter::with_capacity(
+        1024 * 1024,
+        tokio::fs::File::create(target_path)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
 
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
+    let mut last_reported: std::time::Instant = std::time::Instant::now();
     while let Some(chunk) = stream.next().await {
+        if cancel_flag.load(AtomicOrdering::Relaxed) {
+            drop(file);
+            let _ = tokio::fs::remove_file(target_path).await;
+            let mut downloads = downloads_map.lock().await;
+            if let Some(entry) = downloads.get_mut(filename) {
+                entry.status = "cancelled".to_string();
+            }
+            return Ok(());
+        }
         let chunk = chunk.map_err(|e| e.to_string())?;
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         downloaded += chunk.len() as u64;
-        let mut downloads = downloads_map.lock().await;
-        if let Some(entry) = downloads.get_mut(filename) {
-            entry.downloaded_bytes = downloaded;
+        if last_reported.elapsed() >= std::time::Duration::from_millis(250) {
+            let mut downloads = downloads_map.lock().await;
+            if let Some(entry) = downloads.get_mut(filename) {
+                entry.downloaded_bytes = downloaded;
+            }
+            last_reported = std::time::Instant::now();
         }
     }
     file.flush().await.map_err(|e| e.to_string())?;
 
     let mut downloads = downloads_map.lock().await;
     if let Some(entry) = downloads.get_mut(filename) {
+        entry.downloaded_bytes = downloaded;
         entry.status = "complete".to_string();
     }
     Ok(())
@@ -2628,6 +2753,30 @@ async fn hf_download_status(
 ) -> Json<HashMap<String, DownloadProgress>> {
     let downloads = state.hf_downloads.lock().await;
     Json(downloads.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct HfDownloadCancelRequest {
+    filename: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HfDownloadCancelResponse {
+    status: &'static str,
+}
+
+async fn hf_download_cancel(
+    State(state): State<AppState>,
+    Json(payload): Json<HfDownloadCancelRequest>,
+) -> Json<HfDownloadCancelResponse> {
+    let cancel_map = state.hf_cancel.lock().await;
+    match cancel_map.get(&payload.filename) {
+        Some(flag) => {
+            flag.store(true, AtomicOrdering::Relaxed);
+            Json(HfDownloadCancelResponse { status: "cancelling" })
+        }
+        None => Json(HfDownloadCancelResponse { status: "not_found" }),
+    }
 }
 
 /// Find llama-server binary (same logic as in llama-backend)

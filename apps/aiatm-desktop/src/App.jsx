@@ -204,6 +204,20 @@ const HF_PRECISIONS = [
   'Q2_K', 'Q3_K_M', 'Q4_0', 'Q4_K_M', 'Q5_K_M', 'Q6_K', 'Q8_0', 'F16',
 ].map(tag => ({ label: tag, tag }));
 
+const HF_FORMATS = [
+  { label: 'GGUF', tag: 'gguf' },
+  { label: 'Safetensors', tag: 'safetensors' },
+];
+
+// Non-linear parameter-count stops (in billions). Top stop = "no upper limit".
+const HF_PARAM_STOPS = [0, 0.5, 1, 3, 7, 13, 30, 70, 150, 500];
+
+const formatParamStop = (billions) => {
+  if (billions <= 0) return '0';
+  if (billions < 1) return `${Math.round(billions * 1000)}M`;
+  return `${billions % 1 === 0 ? billions : billions.toFixed(1)}B`;
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('models');
   const [modelPath, setModelPath] = useState(
@@ -413,8 +427,10 @@ export default function App() {
   const [hfSearchError, setHfSearchError] = useState(false);
   const [hfSort, setHfSort] = useState('trendingScore');
   const [hfFilters, setHfFilters] = useState([]);
-  const [hfSidebarSections, setHfSidebarSections] = useState({ sort: true, modelType: true, language: false, precision: false });
-  const [hfExpandedRepo, setHfExpandedRepo] = useState(null);
+  const [hfSidebarSections, setHfSidebarSections] = useState({ sort: true, modelType: true, format: true, params: true, language: false, precision: false });
+  const [hfParamMinIdx, setHfParamMinIdx] = useState(0);
+  const [hfParamMaxIdx, setHfParamMaxIdx] = useState(HF_PARAM_STOPS.length - 1);
+  const [hfSelectedRepo, setHfSelectedRepo] = useState(null);
   const [hfRepoFiles, setHfRepoFiles] = useState([]);
   const [hfRepoFilesLoading, setHfRepoFilesLoading] = useState(false);
   const [hfDownloads, setHfDownloads] = useState({});
@@ -427,7 +443,7 @@ export default function App() {
     setHfSearchResults([]);
     setHfSearchLoading(false);
     setHfSearchError(false);
-    setHfExpandedRepo(null);
+    setHfSelectedRepo(null);
     setHfRepoFiles([]);
     setHfDownloads({});
   };
@@ -446,6 +462,23 @@ export default function App() {
     return `${(bytes / 1e6).toFixed(0)} MB`;
   };
 
+  const formatParamCount = (n) => {
+    if (n == null) return null;
+    if (n >= 1e9) return `${(n / 1e9 >= 10 ? Math.round(n / 1e9) : (n / 1e9).toFixed(1))}B`;
+    if (n >= 1e6) return `${(n / 1e6 >= 10 ? Math.round(n / 1e6) : (n / 1e6).toFixed(1))}M`;
+    return `${n}`;
+  };
+
+  const hfParamRangeLabel = () => {
+    const maxTop = HF_PARAM_STOPS.length - 1;
+    const min = HF_PARAM_STOPS[hfParamMinIdx];
+    const max = HF_PARAM_STOPS[hfParamMaxIdx];
+    if (hfParamMinIdx === 0 && hfParamMaxIdx === maxTop) return 'Any';
+    if (hfParamMinIdx === 0) return `Up to ${formatParamStop(max)}`;
+    if (hfParamMaxIdx === maxTop) return `${formatParamStop(min)}+`;
+    return `${formatParamStop(min)} – ${formatParamStop(max)}`;
+  };
+
   const toggleHfFilter = (tag) => {
     setHfFilters(current => current.includes(tag) ? current.filter(t => t !== tag) : [...current, tag]);
   };
@@ -454,17 +487,15 @@ export default function App() {
     setHfSidebarSections(current => ({ ...current, [key]: !current[key] }));
   };
 
-  const runHfSearch = useCallback((query, sort, filters) => {
-    if (!query.trim()) {
-      setHfSearchResults([]);
-      setHfSearchLoading(false);
-      setHfSearchError(false);
-      return;
-    }
+  const runHfSearch = useCallback((query, sort, filters, minParams, maxParams) => {
     setHfSearchLoading(true);
     setHfSearchError(false);
-    const params = new URLSearchParams({ q: query, sort });
+    const params = new URLSearchParams({ sort });
+    const trimmed = query.trim();
+    if (trimmed) params.set('q', trimmed);
     if (filters.length > 0) params.set('filter', filters.join(','));
+    if (minParams != null) params.set('min_params', String(minParams));
+    if (maxParams != null) params.set('max_params', String(maxParams));
     fetch(`http://127.0.0.1:8080/v1/model/hf-search?${params.toString()}`)
       .then(res => res.ok ? res.json() : Promise.reject(new Error('search failed')))
       .then(results => setHfSearchResults(Array.isArray(results) ? results : []))
@@ -475,19 +506,27 @@ export default function App() {
       .finally(() => setHfSearchLoading(false));
   }, []);
 
+  const hfParamBounds = () => {
+    const maxTop = HF_PARAM_STOPS.length - 1;
+    const minParams = hfParamMinIdx > 0 ? Math.round(HF_PARAM_STOPS[hfParamMinIdx] * 1e9) : null;
+    const maxParams = hfParamMaxIdx < maxTop ? Math.round(HF_PARAM_STOPS[hfParamMaxIdx] * 1e9) : null;
+    return [minParams, maxParams];
+  };
+
   useEffect(() => {
     if (modelPickerTab !== 'discover') return;
-    const handle = setTimeout(() => runHfSearch(hfSearchQuery, hfSort, hfFilters), 500);
+    const [minParams, maxParams] = hfParamBounds();
+    const handle = setTimeout(() => runHfSearch(hfSearchQuery, hfSort, hfFilters, minParams, maxParams), 500);
     return () => clearTimeout(handle);
-  }, [hfSearchQuery, hfSort, hfFilters, modelPickerTab, runHfSearch]);
+  }, [hfSearchQuery, hfSort, hfFilters, hfParamMinIdx, hfParamMaxIdx, modelPickerTab, runHfSearch]);
 
-  const expandHfRepo = (repoId) => {
-    if (hfExpandedRepo === repoId) {
-      setHfExpandedRepo(null);
+  const selectHfRepo = (repoId) => {
+    if (hfSelectedRepo === repoId) {
+      setHfSelectedRepo(null);
       setHfRepoFiles([]);
       return;
     }
-    setHfExpandedRepo(repoId);
+    setHfSelectedRepo(repoId);
     setHfRepoFiles([]);
     setHfRepoFilesLoading(true);
     fetch(`http://127.0.0.1:8080/v1/model/hf-files?repo=${encodeURIComponent(repoId)}`)
@@ -515,6 +554,21 @@ export default function App() {
     });
   };
 
+  const cancelHfDownload = (filename) => {
+    fetch('http://127.0.0.1:8080/v1/model/hf-download/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    }).catch(() => {});
+  };
+
+  const fetchCatalog = useCallback(() => {
+    fetch('http://127.0.0.1:8080/v1/model/catalog')
+      .then(res => res.ok ? res.json() : [])
+      .then(models => setDetectedModels(Array.isArray(models) ? models : []))
+      .catch(() => setDetectedModels([]));
+  }, []);
+
   useEffect(() => {
     const activeDownloads = Object.entries(hfDownloads).filter(([, info]) => info.status === 'downloading');
     if (activeDownloads.length === 0) return;
@@ -522,18 +576,31 @@ export default function App() {
       fetch('http://127.0.0.1:8080/v1/model/hf-download/status')
         .then(res => res.ok ? res.json() : {})
         .then(status => {
+          const anyCompleted = Object.entries(status).some(
+            ([filename, info]) =>
+              info.status === 'complete' &&
+              hfDownloads[filename] && hfDownloads[filename].status !== 'complete'
+          );
           setHfDownloads(current => {
             const next = { ...current };
             for (const [filename, info] of Object.entries(status)) {
-              if (next[filename]) next[filename] = { ...next[filename], ...info };
+              if (!next[filename]) continue;
+              if (info.status === 'cancelled') {
+                delete next[filename];
+              } else {
+                next[filename] = { ...next[filename], ...info };
+              }
             }
             return next;
           });
+          // A freshly-downloaded model won't be in the local catalog yet; refetch
+          // so it shows up under "my models" without a manual refresh.
+          if (anyCompleted) fetchCatalog();
         })
         .catch(() => {});
     }, 2000);
     return () => clearInterval(interval);
-  }, [hfDownloads]);
+  }, [hfDownloads, fetchCatalog]);
 
   useEffect(() => {
     localStorage.setItem('antioom-model-cards', JSON.stringify(modelCards));
@@ -657,11 +724,8 @@ export default function App() {
   }, [appSettings.refreshSeconds, fetchLoadedModels]);
 
   useEffect(() => {
-    fetch('http://127.0.0.1:8080/v1/model/catalog')
-      .then(res => res.ok ? res.json() : [])
-      .then(models => setDetectedModels(Array.isArray(models) ? models : []))
-      .catch(() => setDetectedModels([]));
-  }, []);
+    fetchCatalog();
+  }, [fetchCatalog]);
 
   const selectedModel = loadedModels.find(model => model.model_id === selectedModelId) ?? null;
   const selectedCatalogModel = detectedModels.find(model => model.path === selectedModel?.model_path);
@@ -1617,6 +1681,63 @@ export default function App() {
                         </div>
 
                         <div className="hf-sidebar-section">
+                          <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('format')}>
+                            {hfSidebarSections.format ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            Format
+                          </button>
+                          {hfSidebarSections.format && (
+                            <div className="hf-sidebar-section-body hf-checkbox-list">
+                              {HF_FORMATS.map(({ label, tag }) => (
+                                <label key={tag} className="hf-checkbox-item">
+                                  <input type="checkbox" checked={hfFilters.includes(tag)} onChange={() => toggleHfFilter(tag)} />
+                                  {label}
+                                </label>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="hf-sidebar-section">
+                          <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('params')}>
+                            {hfSidebarSections.params ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            Parameters
+                          </button>
+                          {hfSidebarSections.params && (
+                            <div className="hf-sidebar-section-body">
+                              <div className="hf-param-range-label">{hfParamRangeLabel()}</div>
+                              <div className="hf-param-slider">
+                                <div className="hf-param-slider-track" />
+                                <div
+                                  className="hf-param-slider-fill"
+                                  style={{
+                                    left: `${(hfParamMinIdx / (HF_PARAM_STOPS.length - 1)) * 100}%`,
+                                    right: `${100 - (hfParamMaxIdx / (HF_PARAM_STOPS.length - 1)) * 100}%`,
+                                  }}
+                                />
+                                <input
+                                  type="range"
+                                  className="hf-param-slider-input"
+                                  min={0}
+                                  max={HF_PARAM_STOPS.length - 1}
+                                  step={1}
+                                  value={hfParamMinIdx}
+                                  onChange={e => setHfParamMinIdx(Math.min(Number(e.target.value), hfParamMaxIdx))}
+                                />
+                                <input
+                                  type="range"
+                                  className="hf-param-slider-input hf-param-slider-input-top"
+                                  min={0}
+                                  max={HF_PARAM_STOPS.length - 1}
+                                  step={1}
+                                  value={hfParamMaxIdx}
+                                  onChange={e => setHfParamMaxIdx(Math.max(Number(e.target.value), hfParamMinIdx))}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="hf-sidebar-section">
                           <button className="hf-sidebar-section-header" onClick={() => toggleHfSidebarSection('language')}>
                             {hfSidebarSections.language ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                             Language
@@ -1656,10 +1777,10 @@ export default function App() {
                           <input
                             type="text"
                             className="control-input"
-                            placeholder="Search Hugging Face for GGUF models..."
+                            placeholder="Search Hugging Face for models..."
                             value={hfSearchQuery}
                             onChange={e => setHfSearchQuery(e.target.value)}
-                            onKeyDown={e => { if (e.key === 'Enter') runHfSearch(hfSearchQuery, hfSort, hfFilters); }}
+                            onKeyDown={e => { if (e.key === 'Enter') runHfSearch(hfSearchQuery, hfSort, hfFilters, ...hfParamBounds()); }}
                             autoFocus
                           />
                         </div>
@@ -1677,31 +1798,31 @@ export default function App() {
                             <p>Search failed. Check your internet connection.</p>
                           </div>
                         )}
-                        {!hfSearchLoading && !hfSearchError && !hfSearchQuery.trim() && (
+                        {!hfSearchLoading && !hfSearchError && hfSearchResults.length === 0 && (
                           <div className="hf-empty-state">
                             <Search size={22} />
-                            <p>Search for GGUF models on Hugging Face</p>
-                          </div>
-                        )}
-                        {!hfSearchLoading && !hfSearchError && hfSearchQuery.trim() && hfSearchResults.length === 0 && (
-                          <div className="hf-empty-state">
-                            <p>No results found.</p>
+                            <p>{hfSearchQuery.trim() ? 'No results found.' : 'No models match these filters.'}</p>
                           </div>
                         )}
                         {!hfSearchLoading && !hfSearchError && hfSearchResults.map(result => {
                           const repoId = result.id || `${result.author}/${result.modelId}`;
-                          const isExpanded = hfExpandedRepo === repoId;
+                          const isSelected = hfSelectedRepo === repoId;
                           return (
-                            <div key={repoId} className="hf-result-card">
-                              <div className="hf-result-header" onClick={() => expandHfRepo(repoId)}>
+                            <div
+                              key={repoId}
+                              className={`hf-result-card${isSelected ? ' hf-result-card-selected' : ''}`}
+                            >
+                              <div className="hf-result-header" onClick={() => selectHfRepo(repoId)}>
                                 <div>
                                   <strong>{result.modelId || repoId}</strong>
                                   <span className="modal-list-item-meta"> · {result.author}</span>
+                                  {formatParamCount(result.params) && (
+                                    <span className="hf-param-badge">{formatParamCount(result.params)}</span>
+                                  )}
                                 </div>
                                 <div className="hf-result-stats">
                                   <span><Download size={12} /> {formatCount(result.downloads)}</span>
                                   <span><Heart size={12} /> {formatCount(result.likes)}</span>
-                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                                 </div>
                               </div>
                               {result.tags?.length > 0 && (
@@ -1711,66 +1832,128 @@ export default function App() {
                                   ))}
                                 </div>
                               )}
-                              {isExpanded && (
-                                <div className="hf-files-list">
-                                  {hfRepoFilesLoading && (
-                                    <div className="hf-empty-state">
-                                      <Loader size={18} className="spin" />
-                                    </div>
-                                  )}
-                                  {!hfRepoFilesLoading && hfRepoFiles.length === 0 && (
-                                    <p className="modal-list-item-meta">No downloadable files found in this repo.</p>
-                                  )}
-                                  {!hfRepoFilesLoading && hfRepoFiles.length > 0 && (
-                                    <div className="hf-file-row hf-file-row-all">
-                                      <div className="modal-list-item-meta">Download every file into a per-model folder</div>
-                                      <button className="hf-download-btn" onClick={() => startHfDownloadAll(repoId)}>
-                                        <Download size={14} /> Download all files
-                                      </button>
-                                    </div>
-                                  )}
-                                  {!hfRepoFilesLoading && hfRepoFiles.map(file => {
-                                    const download = hfDownloads[file.filename];
-                                    const progressPct = download && download.total_bytes > 0
-                                      ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
-                                      : 0;
-                                    return (
-                                      <div key={file.filename} className="hf-file-row">
-                                        <div>
-                                          <div>{file.filename}</div>
-                                          {download && download.status === 'downloading' && (
-                                            <div className="hf-progress-bar">
-                                              <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
-                                            </div>
-                                          )}
-                                          {download && download.status === 'error' && (
-                                            <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
-                                          )}
-                                        </div>
-                                        <div className="hf-file-actions">
-                                          {file.size != null && <span className="hf-file-size">{formatFileSize(file.size)}</span>}
-                                          {download && download.status === 'complete' ? (
-                                            <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
-                                          ) : (
-                                            <button
-                                              className="hf-download-btn"
-                                              disabled={download?.status === 'downloading'}
-                                              onClick={() => startHfDownload(repoId, file.filename)}
-                                            >
-                                              {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
-                                              {download?.status === 'downloading' ? 'Downloading' : 'Download'}
-                                            </button>
-                                          )}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
                             </div>
                           );
                         })}
                         </div>
+                      </div>
+
+                      <div className="hf-detail-panel">
+                        {!hfSelectedRepo && (
+                          <div className="hf-detail-placeholder">
+                            <Box size={22} />
+                            <p>Select a model to see details</p>
+                          </div>
+                        )}
+                        {hfSelectedRepo && (() => {
+                          const selected = hfSearchResults.find(r => (r.id || `${r.author}/${r.modelId}`) === hfSelectedRepo);
+                          return (
+                            <>
+                              <div className="hf-detail-header">
+                                <div className="hf-detail-title">
+                                  <strong>{selected?.modelId || hfSelectedRepo}</strong>
+                                  {formatParamCount(selected?.params) && (
+                                    <span className="hf-param-badge">{formatParamCount(selected.params)}</span>
+                                  )}
+                                  {selected?.author && <div className="modal-list-item-meta">{selected.author}</div>}
+                                </div>
+                                <button className="hf-detail-close" onClick={() => selectHfRepo(hfSelectedRepo)} title="Close">
+                                  <X size={16} />
+                                </button>
+                              </div>
+
+                              <div className="hf-detail-stats">
+                                <span><Download size={13} /> {formatCount(selected?.downloads)} downloads</span>
+                                <span><Heart size={13} /> {formatCount(selected?.likes)} likes</span>
+                              </div>
+
+                              {selected?.tags?.length > 0 && (
+                                <div className="hf-detail-section">
+                                  <div className="hf-detail-section-title">About</div>
+                                  <div className="hf-result-tags">
+                                    {selected.tags.map(tag => (
+                                      <span key={tag} className="hf-tag-badge">{tag}</span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              <div className="hf-detail-section">
+                                <div className="hf-detail-section-title">Versions</div>
+                                {hfRepoFilesLoading && (
+                                  <div className="hf-empty-state">
+                                    <Loader size={18} className="spin" />
+                                  </div>
+                                )}
+                                {!hfRepoFilesLoading && hfRepoFiles.length === 0 && (
+                                  <p className="modal-list-item-meta">No downloadable files found in this repo.</p>
+                                )}
+                                {!hfRepoFilesLoading && hfRepoFiles.length > 0 && (
+                                  <div className="hf-files-list">
+                                    <div className="hf-file-row hf-file-row-all">
+                                      <div className="modal-list-item-meta">Download every file into a per-model folder</div>
+                                      <button className="hf-download-btn" onClick={() => startHfDownloadAll(hfSelectedRepo)}>
+                                        <Download size={14} /> Download all files
+                                      </button>
+                                    </div>
+                                    {hfRepoFiles.map(file => {
+                                      const download = hfDownloads[file.filename];
+                                      const progressPct = download && download.total_bytes > 0
+                                        ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
+                                        : 0;
+                                      return (
+                                        <div key={file.filename} className="hf-file-row">
+                                          <div className="hf-file-info">
+                                            <div className="hf-file-name-row">
+                                              <span className="hf-file-name">{file.filename}</span>
+                                              {file.size != null && <span className="hf-file-size">{formatFileSize(file.size)}</span>}
+                                            </div>
+                                            {download && download.status === 'downloading' && (
+                                              <>
+                                                <div className="hf-progress-bar">
+                                                  <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                                                </div>
+                                                <div className="hf-progress-row">
+                                                  <span className="hf-progress-text">
+                                                    {formatFileSize(download.downloaded_bytes)} / {formatFileSize(download.total_bytes)}
+                                                  </span>
+                                                  <button
+                                                    className="hf-cancel-btn"
+                                                    onClick={() => cancelHfDownload(file.filename)}
+                                                    title="Cancel download"
+                                                  >
+                                                    <X size={12} />
+                                                  </button>
+                                                </div>
+                                              </>
+                                            )}
+                                            {download && download.status === 'error' && (
+                                              <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
+                                            )}
+                                          </div>
+                                          <div className="hf-file-actions">
+                                            {download && download.status === 'complete' ? (
+                                              <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
+                                            ) : (
+                                              <button
+                                                className="hf-download-btn"
+                                                disabled={download?.status === 'downloading'}
+                                                onClick={() => startHfDownload(hfSelectedRepo, file.filename)}
+                                              >
+                                                {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
+                                                {download?.status === 'downloading' ? 'Downloading' : 'Download'}
+                                              </button>
+                                            )}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            </>
+                          );
+                        })()}
                       </div>
                     </div>
                   )}
