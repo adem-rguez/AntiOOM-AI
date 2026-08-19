@@ -13,6 +13,7 @@ pub enum Modality {
     AudioTts,
     Embedding,
     Video,
+    Mesh3D,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,9 @@ pub struct LoadOptions {
     pub context_size: Option<u32>,
     pub batch_size: Option<u32>,
     pub threads: Option<u32>,
+    /// Optional mmproj (vision projector) path to enable image input on a
+    /// text/vision GGUF. `None` falls back to sibling auto-detection.
+    pub mmproj_path: Option<String>,
     pub params: std::collections::HashMap<String, String>,
 }
 
@@ -39,6 +43,7 @@ impl Default for LoadOptions {
             context_size: Some(4096),
             batch_size: Some(512),
             threads: Some(8),
+            mmproj_path: None,
             params: std::collections::HashMap::new(),
         }
     }
@@ -112,6 +117,42 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
+/// Parameters specific to image-generation requests (Modality::Image). Every
+/// field is optional so backends fall back to their own sensible defaults;
+/// text/audio/video backends simply ignore this field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageParams {
+    pub negative_prompt: Option<String>,
+    pub steps: Option<u32>,
+    pub cfg_scale: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub seed: Option<i64>,
+}
+
+/// Parameters specific to 3D-mesh-generation requests (Modality::Mesh3D).
+/// Every field is optional so backends fall back to their own sensible
+/// defaults; text/image/audio/video backends simply ignore this field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Mesh3dParams {
+    pub input_kind: Option<String>,
+    pub images: Option<Vec<Vec<u8>>>,
+    pub steps: Option<u32>,
+    pub guidance_scale: Option<f32>,
+    pub seed: Option<i64>,
+    pub output_format: Option<String>,
+    pub texture: Option<bool>,
+    pub foreground_ratio: Option<f32>,
+}
+
+/// Parameters specific to speech-synthesis requests (Modality::AudioTts).
+/// Optional so backends fall back to their own defaults; other backends
+/// ignore this field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AudioParams {
+    pub speed: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub request_id: String,
@@ -127,6 +168,15 @@ pub struct InferenceRequest {
     pub tools: Option<Vec<ToolSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    /// Image-generation params (Modality::Image only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_params: Option<ImageParams>,
+    /// 3D-mesh-generation params (Modality::Mesh3D only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_params: Option<Mesh3dParams>,
+    /// Speech-synthesis params (Modality::AudioTts only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_params: Option<AudioParams>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +190,22 @@ pub struct InferenceResponse {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+}
+
+/// Progress record for a long-running generation job (image/mesh/tts), shared
+/// between Python inference servers, backends, and daemon-core's job map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationProgress {
+    pub job_id: String,
+    pub modality: String,
+    pub phase: String,
+    pub step: u32,
+    pub total: u32,
+    pub percent: f32,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,4 +275,10 @@ pub trait InferenceBackend: Send + Sync {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceStream, BackendError>;
+
+    /// Poll for progress on a currently-running generation. Backends without
+    /// a progress source (most of them) keep the default `None`.
+    async fn poll_progress(&self) -> Option<GenerationProgress> {
+        None
+    }
 }

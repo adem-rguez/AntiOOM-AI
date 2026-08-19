@@ -8,6 +8,7 @@ license.workspace = true
 backend-trait = { path = "../backend-trait" }
 llama-backend = { path = "../backends/llama-backend" }
 sd-backend = { path = "../backends/sd-backend" }
+mesh-backend = { path = "../backends/mesh-backend" }
 whisper-backend = { path = "../backends/whisper-backend" }
 tts-backend = { path = "../backends/tts-backend" }
 video-backend = { path = "../backends/video-backend" }

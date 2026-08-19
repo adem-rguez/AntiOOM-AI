@@ -143,8 +143,14 @@ impl InferenceBackend for LlamaBackend {
                 .arg(&ctx_size)
                 .arg("--host")
                 .arg("127.0.0.1");
-            if let Some(mmproj_path) = Self::find_sibling_mmproj(model_path) {
-                info!("Auto-detected vision projector: {}", mmproj_path.display());
+            let mmproj = options.mmproj_path
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .or_else(|| Self::find_sibling_mmproj(model_path));
+            if let Some(mmproj_path) = mmproj {
+                info!("Using vision projector: {}", mmproj_path.display());
                 cmd.arg("--mmproj").arg(&mmproj_path);
             }
 

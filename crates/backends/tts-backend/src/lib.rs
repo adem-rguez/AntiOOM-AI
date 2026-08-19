@@ -246,7 +246,7 @@ impl InferenceBackend for TtsBackend {
             let payload = serde_json::json!({
                 "text": request.prompt,
                 "voice": "af_heart",
-                "speed": 1.0,
+                "speed": request.audio_params.as_ref().and_then(|a| a.speed).unwrap_or(1.0),
             });
 
             let url = format!("http://127.0.0.1:{}/synthesize", self.port);

@@ -48,6 +48,9 @@ message LoadModelRequest {
   Modality modality = 2;
   optional uint32 gpu_layers = 3;
   optional uint32 context_size = 4;
+  // Optional path to an mmproj (vision projector) .gguf, to enable image input
+  // on a text/vision GGUF. Empty/unset falls back to sibling auto-detection.
+  optional string mmproj_path = 5;
 }
 
 message LoadModelResponse {

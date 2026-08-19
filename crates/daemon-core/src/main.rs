@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU16;
 use llama_backend::{process_tracker::ChildRegistry, LlamaBackend};
 use sd_backend::SdBackend;
+use mesh_backend::MeshBackend;
 use whisper_backend::WhisperBackend;
 use tts_backend::TtsBackend;
 use video_backend::VideoBackend;
@@ -71,6 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_backend(Box::new(SdBackend::new())).await;
     info!("Registered backend plugin: stable-diffusion.cpp (Image)");
 
+    registry.register_backend(Box::new(MeshBackend::new())).await;
+    info!("Registered backend plugin: mesh3d-generator (Mesh3D)");
+
     registry.register_backend(Box::new(WhisperBackend::new())).await;
     info!("Registered backend plugin: whisper.cpp (Audio ASR)");
 
@@ -81,7 +85,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Registered backend plugin: Wan Video Runner (Video)");
 
     // 3.5 Initialize Media Store
-    let media_store = Arc::new(MediaStore::new(1800)); // 30-minute TTL
+    let media_disk_dir = std::env::current_dir()?.join("generated-media");
+    let media_store = Arc::new(MediaStore::new(1800, media_disk_dir)); // 30-minute TTL by default
+
+    // Periodic sweep of expired in-memory media (no-op when persisting to disk)
+    {
+        let media_store = media_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                media_store.cleanup_expired().await;
+            }
+        });
+    }
 
     // 4. Start HTTP OpenAI-compatible server & Dashboard on 0.0.0.0:8080
     let loaded_models = Arc::new(tokio::sync::Mutex::new(HashMap::<String, http::LoadedModelEntry>::new()));
@@ -112,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         media_store,
         hf_downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         hf_cancel: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        job_progress: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        studio_models: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
     let app = http::create_router(http_state);
     let http_addr: SocketAddr = "0.0.0.0:8080".parse()?;

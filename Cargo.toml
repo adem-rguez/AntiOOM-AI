@@ -4,6 +4,7 @@ members = [
     "crates/daemon-core",
     "crates/backends/llama-backend",
     "crates/backends/sd-backend",
+    "crates/backends/mesh-backend",
     "crates/backends/whisper-backend",
     "crates/backends/tts-backend",
     "crates/backends/video-backend",

@@ -15,7 +15,7 @@ use crate::session::{ActiveSession, SessionManager};
 use crate::tool_fallback;
 use crate::orchestrator_tools;
 use crate::media_store::MediaStore;
-use backend_trait::{InferenceRequest, Modality, SamplingParams, ToolCall};
+use backend_trait::{GenerationProgress, InferenceBackend, InferenceRequest, Modality, SamplingParams, ToolCall};
 use llama_backend::process_tracker::ChildRegistry;
 use moe_cache::MoeExpertCache;
 use pool_protocol::{ClusterPoolManager, PeerNode};
@@ -29,6 +29,12 @@ pub struct LoadedModelEntry {
     pub context_size: u32,
     pub port: u16,
     pub modality: String,
+    /// True when this loaded instance can accept image input — either a native
+    /// vision model, or a text model launched with an `--mmproj` projector.
+    pub image_input_available: bool,
+    /// For `modality == "mesh3d"`, which input kinds this model accepts
+    /// (subset of "text", "image", "multi_image"). `None` for other modalities.
+    pub mesh_input_kinds: Option<Vec<String>>,
 }
 
 /// Backwards-compat status for single-model callers
@@ -69,11 +75,17 @@ pub struct AppState {
     pub hf_downloads: Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
     /// Cancellation flags for in-progress Hugging Face downloads, keyed by filename.
     pub hf_cancel: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Progress records for in-progress/completed generation jobs (image/mesh/tts), keyed by job_id.
+    pub job_progress: Arc<tokio::sync::Mutex<HashMap<String, GenerationProgress>>>,
+    /// Model paths the user has added to the Model Studio in the frontend.
+    /// `list_models` filters the catalog down to only these when non-empty.
+    pub studio_models: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadProgress {
     pub filename: String,
+    pub repo: String,
     pub total_bytes: Option<u64>,
     pub downloaded_bytes: u64,
     pub status: String,
@@ -147,6 +159,14 @@ pub struct ImageGenerationRequest {
     pub prompt: String,
     pub n: Option<u32>,
     pub size: Option<String>,
+    pub negative_prompt: Option<String>,
+    pub steps: Option<u32>,
+    pub cfg_scale: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub seed: Option<i64>,
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +178,31 @@ pub struct ImageObject {
 pub struct ImageGenerationResponse {
     pub created: u64,
     pub data: Vec<ImageObject>,
+    pub job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Mesh3dGenerationRequest {
+    pub prompt: Option<String>,
+    pub images: Option<Vec<String>>,
+    pub input_kind: String,
+    pub steps: Option<u32>,
+    pub guidance_scale: Option<f32>,
+    pub seed: Option<i64>,
+    pub output_format: Option<String>,
+    pub texture: Option<bool>,
+    pub foreground_ratio: Option<f32>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Mesh3dGenerationResponse {
+    pub created: u64,
+    pub format: String,
+    pub mesh_base64: String,
+    pub generation_time_ms: u64,
+    pub job_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,11 +210,16 @@ pub struct SpeechRequest {
     pub model: String,
     pub input: String,
     pub voice: Option<String>,
+    #[serde(default)]
+    pub speed: Option<f32>,
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SpeechResponse {
     pub audio_b64: String,
+    pub job_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +245,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/chat/completions/stream", post(stream_chat_completions))
         .route("/v1/media/:id", get(get_media))
         .route("/v1/images/generations", post(generate_images))
+        .route("/v1/models3d/generations", post(generate_mesh3d))
         .route("/v1/audio/transcriptions", post(transcribe_audio))
         .route("/v1/audio/speech", post(synthesize_speech))
         .route("/v1/fit-estimator", post(estimate_model_fit))
@@ -203,6 +254,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/model/list", get(list_loaded_models))
         .route("/v1/model/load", post(load_model))
         .route("/v1/model/unload", post(unload_model))
+        .route("/v1/studio/models", post(set_studio_models))
+        .route("/v1/config/media-retention", get(get_media_retention).post(set_media_retention))
         .route("/v1/system/info", get(get_system_info))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/moe/stats", get(get_moe_stats))
@@ -212,6 +265,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/model/hf-download", post(hf_download))
         .route("/v1/model/hf-download/status", get(hf_download_status))
         .route("/v1/model/hf-download/cancel", post(hf_download_cancel))
+        .route("/v1/jobs", get(list_jobs))
+        .route("/v1/jobs/:id/progress", get(get_job_progress))
         .with_state(state)
 }
 
@@ -1119,8 +1174,27 @@ struct StreamChatRequest {
     /// If absent, routes to the first loaded model (or falls back to port 50052).
     pub model_id: Option<String>,
     pub enable_tools: Option<bool>,
+    /// If true, `list_models` tool calls run automatically instead of pausing
+    /// for the user to pick a model.
+    pub autopilot: Option<bool>,
+    /// If set, skip the orchestrator loop entirely and run this model directly
+    /// against the last user message.
+    pub forced_model: Option<String>,
     #[serde(flatten)]
     pub inner: ChatCompletionRequest,
+}
+
+/// Extract the text of a chat message's content, which may be a plain string
+/// or an OpenAI-style array of parts (e.g. `[{"type":"text","text":...}]`).
+fn extract_message_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts.iter()
+            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
 }
 
 /// Port of a loaded model that can serve chat completions, falling back to the
@@ -1257,9 +1331,69 @@ async fn stream_chat_completions(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(512);
 
+    let autopilot = payload.autopilot.unwrap_or(false);
+    let forced_model = payload.forced_model.clone();
+
     let task_state = state.clone();
     let task_tool_schemas = tool_schemas.clone();
     tokio::spawn(async move {
+        // Forced-model short-circuit: skip the orchestrator loop entirely and
+        // run the requested model directly against the last user message.
+        if let Some(model) = forced_model.as_ref().filter(|m| !m.is_empty()) {
+            let prompt = payload.inner.messages.iter().rev()
+                .find(|m| m.role == "user")
+                .map(|m| extract_message_text(&m.content))
+                .unwrap_or_default();
+
+            let tool_call = ToolCall {
+                id: format!("forced-{}", uuid::Uuid::new_v4()),
+                name: "run_model".to_string(),
+                arguments: serde_json::json!({ "model": model, "prompt": prompt }),
+            };
+
+            let job_id = format!("tool-{}", uuid::Uuid::new_v4());
+
+            let status_event = serde_json::json!({
+                "type": "tool_status",
+                "tool_name": tool_call.name,
+                "status": "executing",
+                "job_id": job_id,
+            });
+            if tx.send(Ok(Event::default().data(status_event.to_string()))).await.is_err() {
+                return;
+            }
+
+            let result = match orchestrator_tools::dispatch(&task_state, &tool_call, &job_id).await {
+                Some(result) => result,
+                None => backend_trait::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content: format!("Unknown tool: '{}'.", tool_call.name),
+                    media_handle: None,
+                    media_data: None,
+                    media_type: None,
+                    is_error: true,
+                },
+            };
+
+            let mut result_event = serde_json::json!({
+                "type": "tool_result",
+                "tool_name": tool_call.name,
+                "content": result.content,
+                "is_error": result.is_error,
+                "job_id": job_id,
+            });
+            if let Some(handle) = &result.media_handle {
+                result_event["media_url"] = serde_json::Value::String(handle.clone());
+            }
+            if let Some(media_type) = &result.media_type {
+                result_event["media_type"] = serde_json::Value::String(media_type.clone());
+            }
+            let _ = tx.send(Ok(Event::default().data(result_event.to_string()))).await;
+
+            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+            return;
+        }
+
         // The orchestrator loop: generate, run whatever tool the model asked for,
         // hand the result back, generate again. Ends on a turn that asks for none.
         let mut messages = chat_messages;
@@ -1379,17 +1513,20 @@ async fn stream_chat_completions(
 
             tracing::info!("stream_chat_completions: hop {} calls tool '{}'", hop, tool_call.name);
 
+            let job_id = format!("tool-{}", uuid::Uuid::new_v4());
+
             let status_event = serde_json::json!({
                 "type": "tool_status",
                 "tool_name": tool_call.name,
                 "status": "executing",
+                "job_id": job_id,
             });
             if tx.send(Ok(Event::default().data(status_event.to_string()))).await.is_err() {
                 return;
             }
 
             // Dispatch via the orchestrator tools (list_models / run_model).
-            let result = match orchestrator_tools::dispatch(&task_state, &tool_call).await {
+            let result = match orchestrator_tools::dispatch(&task_state, &tool_call, &job_id).await {
                 Some(result) => result,
                 None => backend_trait::ToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -1406,6 +1543,7 @@ async fn stream_chat_completions(
                 "tool_name": tool_call.name,
                 "content": result.content,
                 "is_error": result.is_error,
+                "job_id": job_id,
             });
             if let Some(handle) = &result.media_handle {
                 result_event["media_url"] = serde_json::Value::String(handle.clone());
@@ -1415,6 +1553,32 @@ async fn stream_chat_completions(
             }
             if tx.send(Ok(Event::default().data(result_event.to_string()))).await.is_err() {
                 return;
+            }
+
+            // The model was browsing available models. If more than one is compatible
+            // with what the user asked for, pause and let the user pick rather than
+            // letting the small orchestrator choose (unless autopilot is on).
+            if tool_call.name == "list_models" && !autopilot {
+                if let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(&result.content) {
+                    if let Some(target) = infer_modality(&last_user_prompt) {
+                        let filtered: Vec<serde_json::Value> = rows.iter()
+                            .filter(|row| row["modality"].as_str() == Some(target))
+                            .cloned()
+                            .collect();
+                        if !filtered.is_empty() {
+                            rows = filtered;
+                        }
+                    }
+                    if rows.len() > 1 {
+                        let choice_event = serde_json::json!({
+                            "type": "model_choice",
+                            "options": rows,
+                        });
+                        let _ = tx.send(Ok(Event::default().data(choice_event.to_string()))).await;
+                        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        return;
+                    }
+                }
             }
 
             // Hand the exchange back so the next hop can act on the result.
@@ -1431,8 +1595,11 @@ async fn stream_chat_completions(
                 }]
             }));
             let mut feedback = result.content.clone();
-            if result.media_handle.is_some() {
-                feedback.push_str(" (the media has already been shown to the user)");
+            if let Some(ref handle) = result.media_handle {
+                feedback.push_str(&format!(
+                    " (the media has already been shown to the user) [Media available at: {}]",
+                    handle
+                ));
             }
             messages.push(serde_json::json!({
                 "role": "tool",
@@ -1447,6 +1614,24 @@ async fn stream_chat_completions(
 
     let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Best-effort guess of the output modality the user is asking for, so the
+/// model picker only offers compatible models. Returns None when unsure.
+fn infer_modality(prompt: &str) -> Option<&'static str> {
+    let p = prompt.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| p.contains(w));
+    if has(&["image", "picture", "photo", "draw", "render", "paint", "logo", "wallpaper", "illustration"]) {
+        Some("image")
+    } else if has(&["video", "animate", "animation", "movie", " clip"]) {
+        Some("video")
+    } else if has(&["transcribe", "transcription", "transcript"]) {
+        Some("audio")
+    } else if has(&["speak", "voice", "narrate", "read aloud", "speech", "pronounce", "text to speech", "tts"]) {
+        Some("tts")
+    } else {
+        None
+    }
 }
 
 /// One upstream request body for a single generation turn.
@@ -1617,7 +1802,8 @@ async fn chat_completions(
                         tc_json["function"]["arguments"].as_str().unwrap_or("{}")
                     ).unwrap_or(serde_json::json!({})),
                 };
-                let result = match orchestrator_tools::dispatch(&state, &tc).await {
+                let job_id = format!("tool-{}", uuid::Uuid::new_v4());
+                let result = match orchestrator_tools::dispatch(&state, &tc, &job_id).await {
                     Some(result) => result,
                     None => backend_trait::ToolResult {
                         tool_call_id: tc.id.clone(),
@@ -1715,7 +1901,8 @@ async fn chat_completions(
             });
 
         if let Some((text_before, tool_call)) = resolved_call {
-            let result = match orchestrator_tools::dispatch(&state, &tool_call).await {
+            let job_id = format!("tool-{}", uuid::Uuid::new_v4());
+            let result = match orchestrator_tools::dispatch(&state, &tool_call, &job_id).await {
                 Some(result) => result,
                 None => backend_trait::ToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -1793,6 +1980,75 @@ async fn chat_completions(
     }))
 }
 
+/// Insert a fresh "queued" progress record for `job_id` into the shared map.
+pub(crate) async fn init_job_progress(state: &AppState, job_id: &str, modality: &str) {
+    let mut jobs = state.job_progress.lock().await;
+    jobs.insert(
+        job_id.to_string(),
+        GenerationProgress {
+            job_id: job_id.to_string(),
+            modality: modality.to_string(),
+            phase: "queued".to_string(),
+            step: 0,
+            total: 0,
+            percent: -1.0,
+            status: "running".to_string(),
+            message: None,
+            updated_at: now_millis(),
+        },
+    );
+}
+
+/// Spawn a background task that polls `backend.poll_progress()` every 150ms
+/// and writes results into the shared job map, stamping `job_id`/`modality`.
+/// Stops once `done_flag` is set.
+pub(crate) fn spawn_progress_poller(
+    jobs_map: Arc<tokio::sync::Mutex<HashMap<String, GenerationProgress>>>,
+    backend_arc: Arc<tokio::sync::RwLock<Box<dyn InferenceBackend>>>,
+    job_id: String,
+    modality: &'static str,
+    done_flag: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));
+        loop {
+            interval.tick().await;
+            if done_flag.load(AtomicOrdering::Relaxed) {
+                break;
+            }
+            let progress = {
+                let b = backend_arc.read().await;
+                b.poll_progress().await
+            };
+            if let Some(mut p) = progress {
+                p.job_id = job_id.clone();
+                p.modality = modality.to_string();
+                let mut jobs = jobs_map.lock().await;
+                jobs.insert(job_id.clone(), p);
+            }
+        }
+    })
+}
+
+/// Finalize a job's progress record as done or errored.
+pub(crate) async fn finalize_job_progress(state: &AppState, job_id: &str, modality: &str, error: Option<&str>) {
+    let mut jobs = state.job_progress.lock().await;
+    jobs.insert(
+        job_id.to_string(),
+        GenerationProgress {
+            job_id: job_id.to_string(),
+            modality: modality.to_string(),
+            phase: if error.is_some() { "error".to_string() } else { "done".to_string() },
+            step: 0,
+            total: 0,
+            percent: if error.is_some() { -1.0 } else { 100.0 },
+            status: if error.is_some() { "error".to_string() } else { "done".to_string() },
+            message: error.map(|e| e.to_string()),
+            updated_at: now_millis(),
+        },
+    );
+}
+
 async fn generate_images(
     State(state): State<AppState>,
     Json(payload): Json<ImageGenerationRequest>,
@@ -1806,7 +2062,31 @@ async fn generate_images(
             "No image backend registered".to_string(),
         ))?;
 
+    let job_id = payload.job_id.clone().unwrap_or_else(|| format!("job-{}", uuid_simple()));
     let request_id = format!("img-{}", uuid_simple());
+
+    // OpenAI-style "WxH" size string is a fallback when width/height aren't
+    // given explicitly.
+    let (size_w, size_h) = payload
+        .size
+        .as_deref()
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+        .map(|(w, h)| (Some(w), Some(h)))
+        .unwrap_or((None, None));
+
+    let image_params = backend_trait::ImageParams {
+        negative_prompt: payload.negative_prompt,
+        steps: payload.steps,
+        cfg_scale: payload.cfg_scale,
+        width: payload.width.or(size_w),
+        height: payload.height.or(size_h),
+        // A negative seed is the UI's "-1 = random" sentinel. Normalize it to
+        // None so backends generate a fresh random seed instead of pinning to
+        // the literal value (sd.exe treats -1 as random, but diffusers'
+        // manual_seed(-1) would lock every render to one fixed seed).
+        seed: payload.seed.filter(|s| *s >= 0),
+    };
 
     let inf_req = InferenceRequest {
         request_id,
@@ -1817,6 +2097,9 @@ async fn generate_images(
         image_input: None,
         tools: None,
         tool_choice: None,
+        image_params: Some(image_params),
+        mesh_params: None,
+        audio_params: None,
     };
 
     {
@@ -1830,13 +2113,29 @@ async fn generate_images(
         }
     }
 
+    init_job_progress(&state, &job_id, "image").await;
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let poller = spawn_progress_poller(
+        state.job_progress.clone(),
+        backend_arc.clone(),
+        job_id.clone(),
+        "image",
+        done_flag.clone(),
+    );
+
     let backend = backend_arc.read().await;
-    let inf_res = backend.generate(inf_req).await.map_err(|e| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            e.to_string(),
-        )
-    })?;
+    let inf_res = backend.generate(inf_req).await;
+    done_flag.store(true, AtomicOrdering::Relaxed);
+    poller.abort();
+
+    let inf_res = match inf_res {
+        Ok(res) => res,
+        Err(e) => {
+            finalize_job_progress(&state, &job_id, "image", Some(&e.to_string())).await;
+            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    finalize_job_progress(&state, &job_id, "image", None).await;
 
     let img_bytes = inf_res.output_data.unwrap_or_default();
     let b64_str = use_base64_encode(&img_bytes);
@@ -1847,6 +2146,114 @@ async fn generate_images(
             .unwrap_or_default()
             .as_secs(),
         data: vec![ImageObject { b64_json: b64_str }],
+        job_id,
+    }))
+}
+
+async fn generate_mesh3d(
+    State(state): State<AppState>,
+    Json(payload): Json<Mesh3dGenerationRequest>,
+) -> Result<Json<Mesh3dGenerationResponse>, (axum::http::StatusCode, String)> {
+    use base64::Engine;
+
+    let backend_arc = state
+        .registry
+        .get_backend(Modality::Mesh3D)
+        .await
+        .ok_or((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No 3D backend registered".to_string(),
+        ))?;
+
+    let is_loaded = {
+        let b = backend_arc.read().await;
+        b.is_loaded()
+    };
+    if !is_loaded {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No 3D model loaded".to_string(),
+        ));
+    }
+
+    let job_id = payload.job_id.clone().unwrap_or_else(|| format!("job-{}", uuid_simple()));
+    let request_id = format!("mesh3d-{}", uuid_simple());
+
+    let images: Vec<Vec<u8>> = payload
+        .images
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|b64| base64::engine::general_purpose::STANDARD.decode(b64))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("Invalid base64 image: {}", e)))?;
+
+    let mesh_params = backend_trait::Mesh3dParams {
+        input_kind: Some(payload.input_kind.clone()),
+        images: if images.is_empty() { None } else { Some(images) },
+        steps: payload.steps,
+        guidance_scale: payload.guidance_scale,
+        seed: payload.seed,
+        output_format: payload.output_format.clone(),
+        texture: payload.texture,
+        foreground_ratio: payload.foreground_ratio,
+    };
+
+    let inf_req = InferenceRequest {
+        request_id,
+        prompt: payload.prompt.clone().unwrap_or_default(),
+        messages: None,
+        sampling: SamplingParams::default(),
+        modality: Modality::Mesh3D,
+        image_input: None,
+        tools: None,
+        tool_choice: None,
+        image_params: None,
+        mesh_params: Some(mesh_params),
+        audio_params: None,
+    };
+
+    init_job_progress(&state, &job_id, "mesh").await;
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let poller = spawn_progress_poller(
+        state.job_progress.clone(),
+        backend_arc.clone(),
+        job_id.clone(),
+        "mesh",
+        done_flag.clone(),
+    );
+
+    let backend = backend_arc.read().await;
+    let inf_res = backend.generate(inf_req).await;
+    done_flag.store(true, AtomicOrdering::Relaxed);
+    poller.abort();
+
+    let inf_res = match inf_res {
+        Ok(res) => res,
+        Err(e) => {
+            finalize_job_progress(&state, &job_id, "mesh", Some(&e.to_string())).await;
+            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    finalize_job_progress(&state, &job_id, "mesh", None).await;
+
+    let mesh_bytes = inf_res.output_data.unwrap_or_default();
+    let mesh_base64 = use_base64_encode(&mesh_bytes);
+    let format = if !inf_res.output_text.is_empty() {
+        inf_res.output_text
+    } else {
+        payload.output_format.unwrap_or_else(|| "glb".to_string())
+    };
+
+    Ok(Json(Mesh3dGenerationResponse {
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        format,
+        mesh_base64,
+        generation_time_ms: inf_res.generation_time_ms,
+        job_id,
     }))
 }
 
@@ -1873,6 +2280,9 @@ async fn transcribe_audio(
         image_input: None,
         tools: None,
         tool_choice: None,
+        image_params: None,
+        mesh_params: None,
+        audio_params: None,
     };
 
     {
@@ -1912,6 +2322,7 @@ async fn synthesize_speech(
             "No TTS backend registered".to_string(),
         ))?;
 
+    let job_id = payload.job_id.clone().unwrap_or_else(|| format!("job-{}", uuid_simple()));
     let request_id = format!("tts-{}", uuid_simple());
 
     let inf_req = InferenceRequest {
@@ -1923,6 +2334,9 @@ async fn synthesize_speech(
         image_input: None,
         tools: None,
         tool_choice: None,
+        image_params: None,
+        mesh_params: None,
+        audio_params: Some(backend_trait::AudioParams { speed: payload.speed }),
     };
 
     {
@@ -1951,18 +2365,24 @@ async fn synthesize_speech(
         }
     }
 
+    init_job_progress(&state, &job_id, "tts").await;
+
     let backend = backend_arc.read().await;
-    let inf_res = backend.generate(inf_req).await.map_err(|e| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            e.to_string(),
-        )
-    })?;
+    let inf_res = backend.generate(inf_req).await;
+
+    let inf_res = match inf_res {
+        Ok(res) => res,
+        Err(e) => {
+            finalize_job_progress(&state, &job_id, "tts", Some(&e.to_string())).await;
+            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    finalize_job_progress(&state, &job_id, "tts", None).await;
 
     let audio_bytes = inf_res.output_data.unwrap_or_default();
     let b64_str = use_base64_encode(&audio_bytes);
 
-    Ok(Json(SpeechResponse { audio_b64: b64_str }))
+    Ok(Json(SpeechResponse { audio_b64: b64_str, job_id }))
 }
 
 fn use_base64_encode(input: &[u8]) -> String {
@@ -2003,12 +2423,46 @@ fn uuid_simple() -> String {
     format!("{:x}", nanos)
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn list_jobs(State(state): State<AppState>) -> Json<Vec<GenerationProgress>> {
+    let jobs = state.job_progress.lock().await;
+    Json(jobs.values().cloned().collect())
+}
+
+async fn get_job_progress(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<GenerationProgress>, axum::http::StatusCode> {
+    let jobs = state.job_progress.lock().await;
+    jobs.get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ModelLoadRequest {
     pub model_path: String,
     pub gpu_layers: Option<u32>,
     pub context_size: Option<u32>,
     pub mmproj_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StudioModelsRequest {
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MediaRetentionConfig {
+    pub ttl_seconds: u64,
+    pub persist_disk: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2029,6 +2483,9 @@ pub struct DetectedModelEntry {
     /// A vision GGUF also needs a local image projector before chat can accept images.
     pub image_input_available: bool,
     pub mmproj_path: Option<String>,
+    /// For `modality == "mesh3d"`, which input kinds this model accepts
+    /// (subset of "text", "image", "multi_image"). `None` for other modalities.
+    pub mesh_input_kinds: Option<Vec<String>>,
 }
 
 fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -2067,9 +2524,70 @@ fn detect_safetensors_causal_lm(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Tokens that identify a 3D mesh-generator model, matched case-insensitively
+/// against the combined "parent dir name + file name" string.
+const MESH3D_NAME_TOKENS: &[&str] = &[
+    "triposr", "tripo", "shap-e", "shap_e", "shape", "point-e", "point_e", "pointe",
+    "instantmesh", "instant-mesh", "instant_mesh", "trellis", "hunyuan3d", "hunyuan-3d",
+    "hunyuan_3d", "sf3d", "stable-fast-3d", "stable_fast_3d", "zero123", "zero-1-2-3",
+    "wonder3d", "sv3d", "lgm", "crm", "-3d", "_3d", " 3d", "llama-mesh", "llama_mesh", "llamamesh",
+];
+
+fn is_mesh3d_name(file_name: &str) -> bool {
+    MESH3D_NAME_TOKENS.iter().any(|token| file_name.contains(token))
+}
+
+/// Which input kinds a detected 3D mesh-generator model accepts, keyed off
+/// the same "parent dir name + file name" string used by `is_mesh3d_name`.
+fn detect_mesh_input_kinds(path: &std::path::Path) -> Option<Vec<String>> {
+    let file_name = {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or_default();
+        format!("{parent} {name}").to_ascii_lowercase()
+    };
+
+    if !is_mesh3d_name(&file_name) {
+        return None;
+    }
+
+    let kinds = if file_name.contains("shap-e") || file_name.contains("shap_e") || file_name.contains("shape")
+        || file_name.contains("point-e") || file_name.contains("point_e") || file_name.contains("pointe")
+    {
+        vec!["text".to_string(), "image".to_string()]
+    } else if file_name.contains("triposr") || file_name.contains("tripo") || file_name.contains("sf3d")
+        || file_name.contains("stable-fast-3d") || file_name.contains("stable_fast_3d")
+    {
+        vec!["image".to_string()]
+    } else if file_name.contains("instantmesh") || file_name.contains("instant-mesh") || file_name.contains("instant_mesh")
+        || file_name.contains("wonder3d") || file_name.contains("sv3d") || file_name.contains("zero123")
+        || file_name.contains("zero-1-2-3")
+    {
+        vec!["image".to_string(), "multi_image".to_string()]
+    } else if file_name.contains("trellis") || file_name.contains("hunyuan3d") || file_name.contains("hunyuan-3d")
+        || file_name.contains("hunyuan_3d")
+    {
+        vec!["text".to_string(), "image".to_string(), "multi_image".to_string()]
+    } else if file_name.contains("crm") || file_name.contains("lgm") {
+        vec!["image".to_string(), "multi_image".to_string()]
+    } else if file_name.contains("llama-mesh") || file_name.contains("llama_mesh") || file_name.contains("llamamesh") {
+        vec!["text".to_string()]
+    } else {
+        vec!["image".to_string()]
+    };
+
+    Some(kinds)
+}
+
 fn detect_model_modality(path: &std::path::Path) -> String {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+    // Match keywords against the parent directory name too: HF downloads land
+    // in a repo-named folder (e.g. `kostakoff_stable-diffusion-v1-5-GGUF/`)
+    // while the file itself is often generically named (`v1-5-pruned_Q4_K.gguf`).
+    let file_name = {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or_default();
+        format!("{parent} {name}").to_ascii_lowercase()
+    };
     match extension.as_str() {
         "gguf" => {
             use std::io::Read;
@@ -2082,17 +2600,21 @@ fn detect_model_modality(path: &std::path::Path) -> String {
                 "tts".to_string()
             } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
                 "audio".to_string()
-            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") {
+            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") || file_name.contains("qwen-image") || file_name.contains("image-edit") {
                 "image".to_string()
             } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
                 "video".to_string()
+            } else if is_mesh3d_name(&file_name) {
+                "mesh3d".to_string()
             } else {
                 "text".to_string()
             }
         }
         "safetensors" if detect_safetensors_causal_lm(path) => "text".to_string(),
         "safetensors" | "ckpt" => {
-            if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") {
+            if is_mesh3d_name(&file_name) {
+                "mesh3d".to_string()
+            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") {
                 "audio".to_string()
             } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") {
                 "tts".to_string()
@@ -2101,7 +2623,9 @@ fn detect_model_modality(path: &std::path::Path) -> String {
             }
         }
         "pth" | "pt" => {
-            if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") || file_name.contains("tacotron") || file_name.contains("fastspeech") {
+            if is_mesh3d_name(&file_name) {
+                "mesh3d".to_string()
+            } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") || file_name.contains("tacotron") || file_name.contains("fastspeech") {
                 "tts".to_string()
             } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
                 "audio".to_string()
@@ -2121,7 +2645,9 @@ fn detect_model_modality(path: &std::path::Path) -> String {
             }
         }
         "onnx" => {
-            if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("asr") {
+            if is_mesh3d_name(&file_name) {
+                "mesh3d".to_string()
+            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("asr") {
                 "audio".to_string()
             } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("unet") || file_name.contains("vae") {
                 "image".to_string()
@@ -2210,11 +2736,103 @@ fn gguf_context_length(path: &std::path::Path) -> Option<u32> {
     None
 }
 
+/// Sum the byte sizes of model weight files inside `dir`, recursing into
+/// component subfolders (e.g. a diffusers repo's `unet/`, `vae/`).
+fn sum_model_weight_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(children) = std::fs::read_dir(dir) else { return total; };
+    for child in children.flatten() {
+        let path = child.path();
+        if path.is_dir() {
+            total += sum_model_weight_bytes(&path);
+        } else if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "safetensors" | "gguf" | "bin" | "pth" | "ckpt")) {
+            total += child.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// Classify a HuggingFace model directory that has its own `config.json`
+/// (transformers-style), mirroring the rules `detect_model_modality` applies
+/// to a standalone `.safetensors` file: `ForCausalLM` architectures are
+/// "text", everything else falls back to filename/dirname keyword matching.
+fn detect_hf_config_dir_modality(dir: &std::path::Path) -> String {
+    let config_path = dir.join("config.json");
+    let is_causal_lm = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .map(|config| {
+            config
+                .get("architectures")
+                .and_then(|a| a.as_array())
+                .map(|architectures| {
+                    architectures
+                        .iter()
+                        .filter_map(|a| a.as_str())
+                        .any(|a| a.ends_with("ForCausalLM"))
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if is_causal_lm {
+        return "text".to_string();
+    }
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+    if is_mesh3d_name(&dir_name) {
+        "mesh3d".to_string()
+    } else if dir_name.contains("whisper") || dir_name.contains("wav2vec") || dir_name.contains("hubert") {
+        "audio".to_string()
+    } else if dir_name.contains("kokoro") || dir_name.contains("tts") || dir_name.contains("vits") || dir_name.contains("bark") {
+        "tts".to_string()
+    } else {
+        "image".to_string()
+    }
+}
+
+/// If `dir` is directly a HuggingFace model directory — it contains its own
+/// `config.json` (transformers-style) or `model_index.json` (diffusers-style)
+/// — build one collapsed `DetectedModelEntry` for the whole directory.
+/// Returns `None` for plain directories, so the caller keeps recursing.
+fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
+    let has_config = dir.join("config.json").is_file();
+    let has_model_index = dir.join("model_index.json").is_file();
+    if !has_config && !has_model_index {
+        return None;
+    }
+
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let modality = if is_mesh3d_name(&dir_name) {
+        "mesh3d".to_string()
+    } else if has_model_index {
+        "image".to_string()
+    } else {
+        detect_hf_config_dir_modality(dir)
+    };
+    let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(dir) } else { None };
+
+    Some(DetectedModelEntry {
+        name: dir.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
+        path: dir.to_string_lossy().to_string(),
+        size_bytes: sum_model_weight_bytes(dir),
+        max_context_size: None,
+        image_input_available: modality == "vision",
+        mmproj_path: None,
+        mesh_input_kinds,
+        modality,
+    })
+}
+
 fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedModelEntry>) {
     let Ok(children) = std::fs::read_dir(directory) else { return; };
     for child in children.flatten() {
         let path = child.path();
         if path.is_dir() {
+            if let Some(entry) = hf_model_dir_entry(&path) {
+                // A HF model dir is emitted as ONE entry — don't also descend
+                // into it to emit per-file entries for its shards/components.
+                entries.push(entry);
+                continue;
+            }
             collect_model_files(&path, entries);
         } else if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gguf" | "safetensors" | "ckpt" | "onnx" | "pth" | "pt" | "bin" | "ot" | "tflite" | "mlmodel" | "engine")) {
             // Skip mmproj companion files — they are not standalone models
@@ -2224,13 +2842,16 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             }
             let size_bytes = child.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             let modality = detect_model_modality(&path);
+            let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(&path) } else { None };
+            let sibling_mmproj = find_sibling_mmproj(&path).map(|p| p.to_string_lossy().to_string());
             entries.push(DetectedModelEntry {
                 name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
                 path: path.to_string_lossy().to_string(),
                 size_bytes,
                 max_context_size: gguf_context_length(&path),
-                image_input_available: modality == "vision",
-                mmproj_path: find_sibling_mmproj(&path).map(|p| p.to_string_lossy().to_string()),
+                image_input_available: modality == "vision" || sibling_mmproj.is_some(),
+                mmproj_path: sibling_mmproj,
+                mesh_input_kinds,
                 modality,
             });
         }
@@ -2409,7 +3030,20 @@ async fn hf_search(
             .get("https://huggingface.co/api/models")
             .query(&[("limit", limit.to_string().as_str()), ("sort", sort.as_str())])
             .query(&[("filter", filter_tags.join(","))])
-            .query(&[("expand[]", "safetensors"), ("expand[]", "gguf")]);
+            // Once ANY expand[] is present the HF API returns *only* the id plus
+            // the fields explicitly expanded, so every field HfModelResult reads
+            // must be listed here or it silently deserializes to its default
+            // (which is why downloads/likes were always 0).
+            .query(&[
+                ("expand[]", "safetensors"),
+                ("expand[]", "gguf"),
+                ("expand[]", "downloads"),
+                ("expand[]", "likes"),
+                ("expand[]", "tags"),
+                ("expand[]", "author"),
+                ("expand[]", "private"),
+                ("expand[]", "lastModified"),
+            ]);
 
         if let Some(q) = params.q.as_ref().filter(|q| !q.is_empty()) {
             request = request.query(&[("search", q.as_str())]);
@@ -2489,6 +3123,8 @@ struct HfTreeLfs {
 #[derive(Debug, Deserialize)]
 struct HfTreeEntry {
     path: String,
+    #[serde(default, rename = "type")]
+    r#type: String,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -2496,20 +3132,186 @@ struct HfTreeEntry {
 }
 
 #[derive(Debug, Serialize)]
+struct HfFilesResponse {
+    files: Vec<HfFileEntry>,
+    kind: String,
+    autodownload: Vec<String>,
+    autodownload_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct HfFileEntry {
     filename: String,
     size: Option<u64>,
+    role: String,
+    quant: Option<String>,
+    variant_group: Option<String>,
+}
+
+fn hf_file_base_name(rfilename: &str) -> &str {
+    rfilename.rsplit('/').next().unwrap_or(rfilename)
+}
+
+/// `-\d+-of-\d+\.(safetensors|gguf)` — `base` must already be lowercased.
+fn is_shard_filename(base: &str) -> bool {
+    let stem = if let Some(stem) = base.strip_suffix(".safetensors") {
+        stem
+    } else if let Some(stem) = base.strip_suffix(".gguf") {
+        stem
+    } else {
+        return false;
+    };
+    let Some(of_idx) = stem.rfind("-of-") else { return false };
+    let after = &stem[of_idx + 4..];
+    if after.is_empty() || !after.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let before = &stem[..of_idx];
+    let Some(dash_idx) = before.rfind('-') else { return false };
+    let num_part = &before[dash_idx + 1..];
+    !num_part.is_empty() && num_part.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Classify a repo file's role from its (repo-relative) path, in the order:
+/// index → shard → mmproj → config → tokenizer → unet/vae/text_encoder →
+/// standalone weights → other.
+fn classify_hf_file_role(rfilename: &str) -> String {
+    let lower = rfilename.to_ascii_lowercase();
+    let base = hf_file_base_name(&lower);
+
+    if base.ends_with(".index.json") {
+        return "index".to_string();
+    }
+    if is_shard_filename(base) {
+        return "shard".to_string();
+    }
+    if base.contains("mmproj") {
+        return "mmproj".to_string();
+    }
+    if base == "config.json" || base == "generation_config.json" {
+        return "config".to_string();
+    }
+    if base.starts_with("tokenizer") || matches!(base, "vocab.json" | "merges.txt" | "special_tokens_map.json") {
+        return "tokenizer".to_string();
+    }
+    if lower.split('/').any(|segment| segment == "unet") {
+        return "unet".to_string();
+    }
+    if lower.split('/').any(|segment| segment == "vae") {
+        return "vae".to_string();
+    }
+    if lower.split('/').any(|segment| segment == "text_encoder" || segment == "text_encoder_2") {
+        return "text_encoder".to_string();
+    }
+    if base.ends_with(".safetensors")
+        || base.ends_with(".gguf")
+        || base.ends_with(".ckpt")
+        || base.ends_with(".bin")
+        || base.ends_with(".pt")
+        || base.ends_with(".pth")
+    {
+        return "weights".to_string();
+    }
+    "other".to_string()
+}
+
+/// Extract a canonical quant/precision token (e.g. "Q4_K_M", "Q8_0", "F16",
+/// "BF16") from a filename. Case-insensitive; returns the uppercased token.
+fn extract_quant_token(filename: &str) -> Option<String> {
+    let upper = filename.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'Q' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let boundary_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if !boundary_ok {
+                continue;
+            }
+            let mut end = i + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            while end > i + 1 && bytes[end - 1] == b'_' {
+                end -= 1;
+            }
+            return Some(upper[i..end].to_string());
+        }
+    }
+    for pattern in ["BF16", "FP16", "FP8", "INT8", "F16", "F32"] {
+        if let Some(idx) = upper.find(pattern) {
+            let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+            let after = idx + pattern.len();
+            let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return Some(pattern.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The weight-file format of a standalone (non-shard) weights filename, used
+/// to group interchangeable quant/precision variants.
+fn standalone_weight_ext(filename: &str) -> Option<&'static str> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".safetensors") {
+        Some("safetensors")
+    } else if lower.ends_with(".gguf") {
+        Some("gguf")
+    } else {
+        None
+    }
+}
+
+/// Pick the best-fit weight file among a "variants" repo's standalone weight
+/// alternatives, sized against `free_vram_bytes`. Returns the chosen entry
+/// plus a human-readable reason.
+fn pick_variant_weights_file<'a>(
+    entries: &'a [HfFileEntry],
+    free_vram_bytes: u64,
+) -> Option<(&'a HfFileEntry, String)> {
+    let variants: Vec<&HfFileEntry> = entries.iter().filter(|e| e.role == "weights" && e.variant_group.is_some()).collect();
+    if variants.is_empty() {
+        return None;
+    }
+    let free_gb = free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let sized: Vec<&HfFileEntry> = variants.iter().copied().filter(|e| e.size.is_some()).collect();
+
+    if sized.is_empty() {
+        let chosen = variants.iter().copied().find(|e| e.quant.as_deref() == Some("Q4_K_M")).unwrap_or(variants[0]);
+        let label = chosen.quant.clone().unwrap_or_else(|| chosen.filename.clone());
+        return Some((chosen, format!("picked {} (size unknown)", label)));
+    }
+
+    let fitting: Vec<&HfFileEntry> = sized
+        .iter()
+        .copied()
+        .filter(|e| (e.size.unwrap() as f64) * 1.2 <= free_vram_bytes as f64)
+        .collect();
+
+    if let Some(best) = fitting.iter().copied().max_by_key(|e| e.size.unwrap()) {
+        let size_gb = best.size.unwrap() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let label = best.quant.clone().unwrap_or_else(|| best.filename.clone());
+        return Some((best, format!("picked {} ({:.1} GB) — fits {:.1} GB free VRAM", label, size_gb, free_gb)));
+    }
+
+    let smallest = sized.iter().copied().min_by_key(|e| e.size.unwrap())?;
+    let label = smallest.quant.clone().unwrap_or_else(|| smallest.filename.clone());
+    Some((smallest, format!("picked {} (smallest) — may exceed {:.1} GB free VRAM", label, free_gb)))
 }
 
 async fn hf_files(
     axum::extract::Query(params): axum::extract::Query<HfFilesQuery>,
-) -> Json<Vec<HfFileEntry>> {
+) -> Json<HfFilesResponse> {
+    fn empty_response() -> HfFilesResponse {
+        HfFilesResponse { files: Vec::new(), kind: "single".to_string(), autodownload: Vec::new(), autodownload_reason: None }
+    }
+
     let client = match reqwest::Client::builder()
         .user_agent("antioom-ai/0.1")
         .build()
     {
         Ok(c) => c,
-        Err(_) => return Json(Vec::new()),
+        Err(_) => return Json(empty_response()),
     };
 
     let url = format!("https://huggingface.co/api/models/{}", params.repo);
@@ -2517,7 +3319,7 @@ async fn hf_files(
         Ok(resp) => resp,
         Err(err) => {
             tracing::warn!("hf-files request failed: {err}");
-            return Json(Vec::new());
+            return Json(empty_response());
         }
     };
 
@@ -2525,26 +3327,30 @@ async fn hf_files(
         Ok(info) => info,
         Err(err) => {
             tracing::warn!("hf-files parse failed: {err}");
-            return Json(Vec::new());
+            return Json(empty_response());
         }
     };
 
-    // The siblings array above leaves `size` = None for large LFS files
-    // (.gguf/.safetensors). The tree API reports the real byte size in
-    // `lfs.size` for LFS-tracked files, so fetch it and use it to fill in
-    // accurate sizes. Fall back to the siblings-based size if this fails.
+    // The recursive tree API is the authoritative complete file list for the
+    // repo (siblings entries can omit subfolder contents' full detail and
+    // leave `size` = None for large LFS files). Fetch it and build the file
+    // list from `type == "file"` entries, using `lfs.size` else `size` for
+    // each file's size. Fall back to `info.siblings` if the tree fetch fails
+    // or yields no file entries.
     let tree_url = format!(
         "https://huggingface.co/api/models/{}/tree/main?recursive=true&expand=1",
         params.repo
     );
-    let mut tree_sizes: HashMap<String, u64> = HashMap::new();
+    let mut tree_files: Vec<(String, Option<u64>)> = Vec::new();
     match client.get(&tree_url).send().await {
         Ok(resp) => match resp.json::<Vec<HfTreeEntry>>().await {
             Ok(entries) => {
                 for entry in entries {
-                    if let Some(size) = entry.lfs.map(|lfs| lfs.size).or(entry.size) {
-                        tree_sizes.insert(entry.path, size);
+                    if entry.r#type != "file" {
+                        continue;
                     }
+                    let size = entry.lfs.map(|lfs| lfs.size).or(entry.size);
+                    tree_files.push((entry.path, size));
                 }
             }
             Err(err) => {
@@ -2556,39 +3362,116 @@ async fn hf_files(
         }
     }
 
-    // Auxiliary files a safetensors repo needs alongside its weight shards to
-    // actually be loadable by `transformers.AutoModelForCausalLM.from_pretrained`.
-    const SAFETENSORS_AUX_FILES: &[&str] = &[
-        "config.json",
-        "generation_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "tokenizer.model",
-        "vocab.json",
-        "merges.txt",
-        "special_tokens_map.json",
-    ];
+    let mut files: Vec<HfFileEntry> = if !tree_files.is_empty() {
+        tree_files
+            .into_iter()
+            .map(|(filename, size)| {
+                let role = classify_hf_file_role(&filename);
+                let quant = extract_quant_token(hf_file_base_name(&filename));
+                HfFileEntry { filename, size, role, quant, variant_group: None }
+            })
+            .collect()
+    } else {
+        info.siblings
+            .into_iter()
+            .map(|s| {
+                let role = classify_hf_file_role(&s.rfilename);
+                let quant = extract_quant_token(hf_file_base_name(&s.rfilename));
+                HfFileEntry { filename: s.rfilename, size: s.size, role, quant, variant_group: None }
+            })
+            .collect()
+    };
 
-    let files = info
-        .siblings
-        .into_iter()
-        .filter(|s| {
-            let name = s.rfilename.to_lowercase();
-            let base_name = name.rsplit('/').next().unwrap_or(&name);
-            name.ends_with(".gguf")
-                || name.ends_with(".safetensors")
-                || SAFETENSORS_AUX_FILES.contains(&base_name)
-        })
-        .map(|s| {
-            let size = tree_sizes.get(&s.rfilename).copied().or(s.size);
-            HfFileEntry {
-                filename: s.rfilename,
-                size,
+    // Group standalone weight files into interchangeable variants when a
+    // repo offers 2+ alternatives of the same weight format (different
+    // quants/precisions of the same model).
+    let gguf_weight_count = files.iter().filter(|f| f.role == "weights" && standalone_weight_ext(&f.filename) == Some("gguf")).count();
+    let safetensors_weight_count = files.iter().filter(|f| f.role == "weights" && standalone_weight_ext(&f.filename) == Some("safetensors")).count();
+    for f in files.iter_mut() {
+        if f.role != "weights" {
+            continue;
+        }
+        match standalone_weight_ext(&f.filename) {
+            Some("gguf") if gguf_weight_count >= 2 => f.variant_group = Some("gguf".to_string()),
+            Some("safetensors") if safetensors_weight_count >= 2 => f.variant_group = Some("safetensors".to_string()),
+            _ => {}
+        }
+    }
+
+    let has_components = files.iter().any(|f| matches!(f.role.as_str(), "unet" | "vae" | "text_encoder"))
+        || files.iter().any(|f| hf_file_base_name(&f.filename) == "model_index.json");
+    let has_shard_or_index = files.iter().any(|f| matches!(f.role.as_str(), "shard" | "index"));
+    let standalone_weight_count = files.iter().filter(|f| f.role == "weights").count();
+
+    let kind = if has_components {
+        "components"
+    } else if has_shard_or_index {
+        "sharded"
+    } else if standalone_weight_count >= 2 {
+        "variants"
+    } else {
+        "single"
+    }
+    .to_string();
+
+    let mmproj_filename = files.iter().find(|f| f.role == "mmproj").map(|f| f.filename.clone());
+
+    let (autodownload, autodownload_reason): (Vec<String>, Option<String>) = match kind.as_str() {
+        "sharded" => {
+            let shard_count = files.iter().filter(|f| f.role == "shard").count();
+            let mut names: Vec<String> = files
+                .iter()
+                .filter(|f| matches!(f.role.as_str(), "shard" | "index" | "config" | "tokenizer"))
+                .map(|f| f.filename.clone())
+                .collect();
+            if let Some(mmproj) = &mmproj_filename {
+                names.push(mmproj.clone());
             }
-        })
-        .collect();
+            (names, Some(format!("Complete {}-shard set + config & tokenizer", shard_count)))
+        }
+        "components" => {
+            let names: Vec<String> = files
+                .iter()
+                .filter(|f| f.variant_group.is_none())
+                .map(|f| f.filename.clone())
+                .collect();
+            (names, Some("All pipeline components".to_string()))
+        }
+        "variants" => {
+            let sys = HardwareProfiler::probe();
+            let free_vram_bytes = if sys.free_vram_bytes > 0 { sys.free_vram_bytes } else { sys.available_ram_bytes };
+            match pick_variant_weights_file(&files, free_vram_bytes) {
+                Some((chosen, reason)) => {
+                    let mut names = vec![chosen.filename.clone()];
+                    names.extend(
+                        files
+                            .iter()
+                            .filter(|f| matches!(f.role.as_str(), "config" | "tokenizer"))
+                            .map(|f| f.filename.clone()),
+                    );
+                    if let Some(mmproj) = &mmproj_filename {
+                        names.push(mmproj.clone());
+                    }
+                    (names, Some(reason))
+                }
+                None => (Vec::new(), None),
+            }
+        }
+        _ => {
+            // "single"
+            let mut names: Vec<String> = files
+                .iter()
+                .filter(|f| matches!(f.role.as_str(), "weights" | "config" | "tokenizer"))
+                .map(|f| f.filename.clone())
+                .collect();
+            if let Some(mmproj) = &mmproj_filename {
+                names.push(mmproj.clone());
+            }
+            (names, Some("Model weights + config".to_string()))
+        }
+    };
 
-    Json(files)
+    Json(HfFilesResponse { files, kind, autodownload, autodownload_reason })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2622,6 +3505,7 @@ async fn hf_download(
             payload.filename.clone(),
             DownloadProgress {
                 filename: payload.filename.clone(),
+                repo: payload.repo.clone(),
                 total_bytes: None,
                 downloaded_bytes: 0,
                 status: "downloading".to_string(),
@@ -2822,10 +3706,17 @@ async fn spawn_hf_transformers_server(
             script_path.display()
         ));
     }
-    let model_dir = model_path
-        .parent()
-        .ok_or_else(|| format!("Model path '{}' has no parent directory", model_path.display()))?
-        .to_path_buf();
+    // `model_path` may already be a model directory (e.g. a collapsed HF
+    // folder from `list_detected_models`), or a single weight file whose
+    // parent directory is what `from_pretrained` expects.
+    let model_dir = if model_path.is_dir() {
+        model_path.to_path_buf()
+    } else {
+        model_path
+            .parent()
+            .ok_or_else(|| format!("Model path '{}' has no parent directory", model_path.display()))?
+            .to_path_buf()
+    };
 
     tokio::task::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
@@ -2881,6 +3772,32 @@ async fn spawn_hf_transformers_server(
 }
 
 /// Load a model: detect modality and spawn the appropriate backend.
+pub(crate) async fn set_studio_models(
+    State(state): State<AppState>,
+    Json(payload): Json<StudioModelsRequest>,
+) -> Json<serde_json::Value> {
+    let mut studio_models = state.studio_models.lock().await;
+    studio_models.clear();
+    studio_models.extend(payload.paths);
+    Json(serde_json::json!({ "ok": true, "count": studio_models.len() }))
+}
+
+pub(crate) async fn set_media_retention(
+    State(state): State<AppState>,
+    Json(payload): Json<MediaRetentionConfig>,
+) -> Json<MediaRetentionConfig> {
+    state.media_store.set_retention(payload.ttl_seconds, payload.persist_disk);
+    let (ttl_seconds, persist_disk) = state.media_store.retention();
+    Json(MediaRetentionConfig { ttl_seconds, persist_disk })
+}
+
+pub(crate) async fn get_media_retention(
+    State(state): State<AppState>,
+) -> Json<MediaRetentionConfig> {
+    let (ttl_seconds, persist_disk) = state.media_store.retention();
+    Json(MediaRetentionConfig { ttl_seconds, persist_disk })
+}
+
 pub(crate) async fn load_model(
     State(state): State<AppState>,
     Json(payload): Json<ModelLoadRequest>,
@@ -2893,12 +3810,33 @@ pub(crate) async fn load_model(
 
     let gpu_layers = payload.gpu_layers.unwrap_or(99);
     let context_size = payload.context_size.unwrap_or(4096);
-    let modality = detect_model_modality(&model_path);
+    // `model_path` may be a collapsed HF model directory (see
+    // `hf_model_dir_entry`) rather than a single weight file; classify those
+    // the same way the catalog scan does before falling back to the
+    // extension/content-based file classifier.
+    let dir_name = model_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let modality = if model_path.is_dir() {
+        if is_mesh3d_name(&dir_name) {
+            "mesh3d".to_string()
+        } else if model_path.join("model_index.json").is_file() {
+            "image".to_string()
+        } else if model_path.join("config.json").is_file() {
+            detect_hf_config_dir_modality(&model_path)
+        } else {
+            detect_model_modality(&model_path)
+        }
+    } else {
+        detect_model_modality(&model_path)
+    };
     tracing::info!("Detected modality '{}' for model: {}", modality, model_path.display());
 
     // Allocate a new port
     let port = state.next_port.fetch_add(1, AtomicOrdering::SeqCst);
     let model_id = new_model_id(port);
+
+    // Set when a text/vision model is launched with an mmproj projector, so the
+    // loaded entry can advertise image input even for models detected as "text".
+    let mut mmproj_loaded = false;
 
     match modality.as_str() {
         "tts" => {
@@ -2971,12 +3909,37 @@ pub(crate) async fn load_model(
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+        "mesh3d" => {
+            tracing::info!("Loading 3D mesh model via mesh3d backend: {}", model_path.display());
+            let backend_arc = state.registry.get_backend(Modality::Mesh3D).await;
+            if let Some(backend_arc) = backend_arc {
+                let mut b = backend_arc.write().await;
+                let opts = backend_trait::LoadOptions {
+                    gpu_layers: Some(gpu_layers),
+                    context_size: Some(context_size),
+                    ..Default::default()
+                };
+                if let Err(e) = b.load_model(&model_path, &opts).await {
+                    tracing::warn!("Mesh3D backend load_model error: {}", e);
+                    return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
         _ => {
-            let is_safetensors = model_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("safetensors"))
-                .unwrap_or(false);
+            // A directory here is a collapsed HF model dir with its own
+            // `config.json` (the `model_index.json` / image case is routed
+            // through the "image" arm above via modality detection). Spawn
+            // the transformers server directly against it.
+            let is_safetensors = if model_path.is_dir() {
+                true
+            } else {
+                model_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("safetensors"))
+                    .unwrap_or(false)
+            };
 
             if is_safetensors {
                 // Config-detected CausalLM safetensors model — spawn the
@@ -3023,6 +3986,7 @@ pub(crate) async fn load_model(
                 if let Some(mmproj_path) = &mmproj {
                     tracing::info!("Using vision projector: {}", mmproj_path.display());
                     child_cmd.arg("--mmproj").arg(mmproj_path);
+                    mmproj_loaded = true;
                 } else {
                     tracing::warn!("No vision projector found for model: {}", model_path.display());
                 }
@@ -3043,6 +4007,8 @@ pub(crate) async fn load_model(
         }
     }
 
+    let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(&model_path) } else { None };
+
     let entry = LoadedModelEntry {
         model_id: model_id.clone(),
         model_path: payload.model_path.clone(),
@@ -3050,6 +4016,8 @@ pub(crate) async fn load_model(
         context_size,
         port,
         modality: modality.clone(),
+        image_input_available: modality == "vision" || mmproj_loaded,
+        mesh_input_kinds,
     };
 
     {

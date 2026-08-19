@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { 
+import {
   MessageSquare, Sparkles, Volume2, Video,
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
-  CheckCircle2, XCircle, PackagePlus, Box, Paperclip, X, Pencil,
-  Search, Download, Globe, Loader, Check, Heart
+  CheckCircle2, XCircle, PackagePlus, Box, Boxes, Paperclip, X, Pencil,
+  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import Mesh3DViewer, { isMeshResource, guessMeshFormat } from './Mesh3DViewer';
 import './App.css';
 
 function findResponseStart(text) {
@@ -95,6 +96,34 @@ function ThinkingBlock({ thinkText, hadThinkTag }) {
   );
 }
 
+// Generation progress bar, shared by the image/mesh/tts studios. `progress` is
+// a GenerationProgress record (see /v1/jobs/:id/progress) or null when idle.
+function GenProgressBar({ progress }) {
+  if (!progress) return null;
+  const determinate = progress.percent >= 0 && progress.total > 0;
+  return (
+    <div className="gen-progress">
+      {determinate ? (
+        <>
+          <div className="gen-progress-bar">
+            <div className="gen-progress-fill" style={{ width: `${Math.min(100, progress.percent)}%` }} />
+          </div>
+          <span className="gen-progress-text">
+            {progress.step}/{progress.total} · {Math.round(progress.percent)}% · {progress.phase}
+          </span>
+        </>
+      ) : (
+        <>
+          <div className="gen-progress-bar gen-progress-indeterminate">
+            <div className="gen-progress-fill-indeterminate" />
+          </div>
+          <span className="gen-progress-text">{progress.phase}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
 // Stable identity for a loaded model. Backend model_ids are timestamped
 // (mdl-{millis}-{port}), so reloading the same file yields a new id. The file's
 // basename is the only thing that survives across loads; normalize it so
@@ -117,6 +146,9 @@ function AttachmentPreview({ attachment }) {
   }
   if (attachment.type.startsWith('video/')) {
     return <video className="chat-attachment-media" controls src={attachment.dataUrl} />;
+  }
+  if (isMeshResource(attachment.type, attachment.name)) {
+    return <Mesh3DViewer base64={attachment.dataUrl} format={guessMeshFormat(attachment.name)} />;
   }
   return <a className="chat-attachment-file" href={attachment.dataUrl} download={attachment.name}>{attachment.name}</a>;
 }
@@ -212,6 +244,26 @@ const HF_FORMATS = [
 // Non-linear parameter-count stops (in billions). Top stop = "no upper limit".
 const HF_PARAM_STOPS = [0, 0.5, 1, 3, 7, 13, 30, 70, 150, 500];
 
+const HF_FILE_ROLE_INFO = {
+  mmproj: { icon: '👁', tooltip: 'Gives the model vision — lets it understand images' },
+  config: { icon: '⚙', tooltip: 'Model configuration' },
+  tokenizer: { icon: '🔤', tooltip: 'Tokenizer / vocabulary' },
+  shard: { icon: '🧩', tooltip: 'One part of the split model weights (needs all parts)' },
+  index: { icon: '🗺', tooltip: 'Map of which weights live in which shard' },
+  weights: { icon: '📦', tooltip: 'Model weights' },
+  vae: { icon: '🎨', tooltip: 'VAE — encodes/decodes images' },
+  unet: { icon: '🌀', tooltip: 'U-Net — the diffusion core' },
+  text_encoder: { icon: '📝', tooltip: 'Text encoder — understands the prompt' },
+};
+
+const getHfFileRoleInfo = (file) => {
+  const info = HF_FILE_ROLE_INFO[file?.role] || { icon: '📄', tooltip: 'Supporting file' };
+  if (file?.role === 'weights' && file?.quant) {
+    return { ...info, tooltip: `${info.tooltip} · ${file.quant}` };
+  }
+  return info;
+};
+
 const formatParamStop = (billions) => {
   if (billions <= 0) return '0';
   if (billions < 1) return `${Math.round(billions * 1000)}M`;
@@ -233,24 +285,42 @@ export default function App() {
   ]);
   const [inputPrompt, setInputPrompt] = useState('');
   const [attachments, setAttachments] = useState([]);
+  const [pendingModelChoice, setPendingModelChoice] = useState(null);
   const attachmentInputRef = useRef(null);
   const mmprojInputRef = useRef(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const defaultAppSettings = {
+    autoSelectNewest: true,
+    refreshSeconds: 3,
+    showThoughtProcess: true,
+    autopilot: false,
+    mediaRetention: { ttl_seconds: 1800, persist_disk: false },
+  };
   const [appSettings, setAppSettings] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem('aiatm.general-settings')) ?? {
-        autoSelectNewest: true,
-        refreshSeconds: 3,
-        showThoughtProcess: true,
-      };
+      const stored = JSON.parse(localStorage.getItem('aiatm.general-settings'));
+      return stored ? { ...defaultAppSettings, ...stored } : defaultAppSettings;
     } catch {
-      return { autoSelectNewest: true, refreshSeconds: 3, showThoughtProcess: true };
+      return defaultAppSettings;
     }
   });
 
   useEffect(() => {
     localStorage.setItem('aiatm.general-settings', JSON.stringify(appSettings));
   }, [appSettings]);
+
+  // Sync saved media retention preference to daemon on startup (daemon defaults to 30min otherwise).
+  useEffect(() => {
+    fetch('http://127.0.0.1:8080/v1/config/media-retention', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(appSettings.mediaRetention),
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const [autopilot, setAutopilot] = useState(appSettings.autopilot ?? false);
+  useEffect(() => { setAutopilot(appSettings.autopilot ?? false); }, [appSettings.autopilot]);
 
   // Hardware stats state
   const [sysInfo, setSysInfo] = useState({
@@ -263,13 +333,37 @@ export default function App() {
 
   // Image Studio State
   const [imgPrompt, setImgPrompt] = useState('A futuristic cyberpunk city skyline at sunset, photorealistic, 8k');
+  const [imgNegativePrompt, setImgNegativePrompt] = useState('');
+  const [imgSteps, setImgSteps] = useState(25);
+  const [imgCfgScale, setImgCfgScale] = useState(7);
+  const [imgWidth, setImgWidth] = useState(512);
+  const [imgHeight, setImgHeight] = useState(512);
+  const [imgSeed, setImgSeed] = useState(-1);
   const [imgSrc, setImgSrc] = useState(null);
   const [isGeneratingImg, setIsGeneratingImg] = useState(false);
+  const [imgProgress, setImgProgress] = useState(null);
+
+  // 3D Model Studio State
+  const [mesh3dPrompt, setMesh3dPrompt] = useState('A low-poly wooden treasure chest, game-ready asset');
+  const [mesh3dImages, setMesh3dImages] = useState([]); // [{name, dataUrl}]
+  const [mesh3dInputKind, setMesh3dInputKind] = useState('text');
+  const [mesh3dSteps, setMesh3dSteps] = useState(64);
+  const [mesh3dGuidance, setMesh3dGuidance] = useState(15);
+  const [mesh3dSeed, setMesh3dSeed] = useState(-1);
+  const [mesh3dFormat, setMesh3dFormat] = useState('glb');
+  const [mesh3dTexture, setMesh3dTexture] = useState(true);
+  const [mesh3dResult, setMesh3dResult] = useState(null); // {base64, format}
+  const [isGeneratingMesh, setIsGeneratingMesh] = useState(false);
+  const [meshProgress, setMeshProgress] = useState(null);
+  const mesh3dImageInputRef = useRef(null);
+  const mesh3dMultiImageInputRef = useRef(null);
 
   // Voice Studio State
   const [ttsInput, setTtsInput] = useState('Welcome to AIATM Standalone Desktop Application.');
+  const [ttsSpeed, setTtsSpeed] = useState(1.0);
   const [audioSrc, setAudioSrc] = useState(null);
   const [isGeneratingTts, setIsGeneratingTts] = useState(false);
+  const [ttsProgress, setTtsProgress] = useState(null);
 
   // Default values used by the fit preview and new model configuration.
   const [gpuLayers, setGpuLayers] = useState(99);
@@ -433,7 +527,12 @@ export default function App() {
   const [hfSelectedRepo, setHfSelectedRepo] = useState(null);
   const [hfRepoFiles, setHfRepoFiles] = useState([]);
   const [hfRepoFilesLoading, setHfRepoFilesLoading] = useState(false);
+  const [hfRepoKind, setHfRepoKind] = useState(null);
+  const [hfAutodownload, setHfAutodownload] = useState([]);
+  const [hfAutodownloadReason, setHfAutodownloadReason] = useState(null);
   const [hfDownloads, setHfDownloads] = useState({});
+  const [showDownloadsPanel, setShowDownloadsPanel] = useState(false);
+  const [pendingCatalogJump, setPendingCatalogJump] = useState(null);
 
   const closeModelPicker = () => {
     setShowModelPicker(false);
@@ -445,7 +544,7 @@ export default function App() {
     setHfSearchError(false);
     setHfSelectedRepo(null);
     setHfRepoFiles([]);
-    setHfDownloads({});
+    setPendingCatalogJump(null);
   };
 
   const formatCount = (n) => {
@@ -524,14 +623,26 @@ export default function App() {
     if (hfSelectedRepo === repoId) {
       setHfSelectedRepo(null);
       setHfRepoFiles([]);
+      setHfRepoKind(null);
+      setHfAutodownload([]);
+      setHfAutodownloadReason(null);
       return;
     }
     setHfSelectedRepo(repoId);
     setHfRepoFiles([]);
+    setHfRepoKind(null);
+    setHfAutodownload([]);
+    setHfAutodownloadReason(null);
     setHfRepoFilesLoading(true);
     fetch(`http://127.0.0.1:8080/v1/model/hf-files?repo=${encodeURIComponent(repoId)}`)
-      .then(res => res.ok ? res.json() : [])
-      .then(files => setHfRepoFiles(Array.isArray(files) ? files : []))
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        const files = Array.isArray(data) ? data : (Array.isArray(data?.files) ? data.files : []);
+        setHfRepoFiles(files);
+        setHfRepoKind(Array.isArray(data) ? null : (data?.kind ?? null));
+        setHfAutodownload(Array.isArray(data?.autodownload) ? data.autodownload : []);
+        setHfAutodownloadReason(Array.isArray(data) ? null : (data?.autodownload_reason ?? null));
+      })
       .catch(() => setHfRepoFiles([]))
       .finally(() => setHfRepoFilesLoading(false));
   };
@@ -554,6 +665,13 @@ export default function App() {
     });
   };
 
+  const startHfAutodownload = (repoId) => {
+    hfAutodownload.forEach(filename => {
+      if (hfDownloads[filename]?.status === 'complete') return;
+      startHfDownload(repoId, filename);
+    });
+  };
+
   const cancelHfDownload = (filename) => {
     fetch('http://127.0.0.1:8080/v1/model/hf-download/cancel', {
       method: 'POST',
@@ -562,6 +680,49 @@ export default function App() {
     }).catch(() => {});
   };
 
+  // "Find in catalog" from the downloads tracker: open the catalog on Discover,
+  // seed the search with the repo, then let the effects below drive selection
+  // and scroll/highlight once the async search + file-list fetch settle.
+  const jumpToCatalogEntry = (repo, filename) => {
+    setShowDownloadsPanel(false);
+    setShowModelPicker(true);
+    setModelPickerTab('discover');
+    setHfSearchQuery(repo);
+    setPendingCatalogJump({ repo, filename });
+  };
+
+  // Once the Discover search settles, auto-select the matching repo card.
+  // Fails soft: if the repo isn't in the (capped) search results, drop the
+  // pending jump and leave the catalog open with the query seeded.
+  useEffect(() => {
+    if (!pendingCatalogJump || modelPickerTab !== 'discover' || hfSearchLoading) return;
+    if (hfSelectedRepo === pendingCatalogJump.repo) return;
+    const match = hfSearchResults.find(r => (r.id || `${r.author}/${r.modelId}`) === pendingCatalogJump.repo);
+    if (match) {
+      selectHfRepo(pendingCatalogJump.repo);
+    } else {
+      setPendingCatalogJump(null);
+    }
+  }, [pendingCatalogJump, modelPickerTab, hfSearchLoading, hfSearchResults, hfSelectedRepo]);
+
+  // Once the selected repo's file list settles, scroll to and briefly
+  // highlight the target file row. Fails soft if the file isn't found.
+  useEffect(() => {
+    if (!pendingCatalogJump || hfSelectedRepo !== pendingCatalogJump.repo || hfRepoFilesLoading) return;
+    const { filename } = pendingCatalogJump;
+    const raf = requestAnimationFrame(() => {
+      const escaped = window.CSS?.escape ? window.CSS.escape(filename) : filename;
+      const el = document.querySelector(`[data-filename="${escaped}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('hf-file-row-highlight');
+        setTimeout(() => el.classList.remove('hf-file-row-highlight'), 2000);
+      }
+      setPendingCatalogJump(null);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [pendingCatalogJump, hfSelectedRepo, hfRepoFilesLoading, hfRepoFiles]);
+
   const fetchCatalog = useCallback(() => {
     fetch('http://127.0.0.1:8080/v1/model/catalog')
       .then(res => res.ok ? res.json() : [])
@@ -569,6 +730,18 @@ export default function App() {
       .catch(() => setDetectedModels([]));
   }, []);
 
+  // Seed hfDownloads from the daemon on mount so downloads started in a
+  // previous popup session (or before this page loaded) are recovered.
+  useEffect(() => {
+    fetch('http://127.0.0.1:8080/v1/model/hf-download/status')
+      .then(res => res.ok ? res.json() : {})
+      .then(status => setHfDownloads(current => ({ ...status, ...current })))
+      .catch(() => {});
+  }, []);
+
+  // Global download-status polling: runs independent of the catalog modal
+  // being open so the tracker stays accurate even after it's closed. Only
+  // polls while something is actively downloading.
   useEffect(() => {
     const activeDownloads = Object.entries(hfDownloads).filter(([, info]) => info.status === 'downloading');
     if (activeDownloads.length === 0) return;
@@ -584,12 +757,7 @@ export default function App() {
           setHfDownloads(current => {
             const next = { ...current };
             for (const [filename, info] of Object.entries(status)) {
-              if (!next[filename]) continue;
-              if (info.status === 'cancelled') {
-                delete next[filename];
-              } else {
-                next[filename] = { ...next[filename], ...info };
-              }
+              next[filename] = { ...next[filename], ...info };
             }
             return next;
           });
@@ -604,6 +772,14 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem('antioom-model-cards', JSON.stringify(modelCards));
+  }, [modelCards]);
+
+  useEffect(() => {
+    fetch('http://127.0.0.1:8080/v1/studio/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: modelCards.map(c => c.modelPath) }),
+    }).catch(() => {});
   }, [modelCards]);
 
   useEffect(() => {
@@ -630,18 +806,29 @@ export default function App() {
     },
   ];
 
-  const openConfigPanel = (preset) => {
-    const maxContextSize = preset.max_context_size ?? null;
+  const openConfigPanel = (card) => {
+    const s = card.settings || {};
+    const maxContextSize = card.max_context_size ?? null;
     setConfigTarget({
-      model_path: preset.path,
-      name: preset.name,
-      tag: preset.tag,
-      gpu_layers: preset.defaultGpu ?? 99,
-      context_size: maxContextSize ? Math.min(preset.defaultCtx ?? 4096, maxContextSize) : (preset.defaultCtx ?? 4096),
+      cardId: card.id,
+      model_path: card.modelPath,
+      name: card.name,
+      modality: card.modality || 'text',
+      mesh_input_kinds: card.mesh_input_kinds || detectedModels.find(m => m.path === card.modelPath)?.mesh_input_kinds || null,
+      gpu_layers: s.gpu_layers ?? 99,
+      context_size: maxContextSize ? Math.min(s.context_size ?? 4096, maxContextSize) : (s.context_size ?? 4096),
       max_context_size: maxContextSize,
-      temperature: preset.defaultTemp ?? 0.7,
-      top_p: preset.defaultTopP ?? 0.9,
-      mmproj_path: preset.mmproj_path || detectedModels.find(m => m.path === preset.path)?.mmproj_path || '',
+      temperature: s.temperature ?? 0.7,
+      top_p: s.top_p ?? 0.9,
+      steps: s.steps,
+      cfg_scale: s.cfg_scale,
+      width: s.width,
+      height: s.height,
+      seed: s.seed,
+      guidance_scale: s.guidance_scale,
+      texture: s.texture,
+      speed: s.speed,
+      mmproj_path: s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || '',
     });
   };
 
@@ -692,6 +879,62 @@ export default function App() {
     }
   };
 
+  // Seed the relevant studio's live controls from the model's configured
+  // defaults, so settings chosen in the Configure sidebar actually drive
+  // generation. Fallbacks match each studio's own defaults.
+  const applyModelDefaults = (cfg) => {
+    if (!cfg) return;
+    switch (cfg.modality) {
+      case 'text':
+      case 'vision':
+        setTemperature(cfg.temperature ?? 0.7);
+        setTopP(cfg.top_p ?? 0.9);
+        break;
+      case 'image':
+        setImgSteps(cfg.steps ?? 25);
+        setImgCfgScale(cfg.cfg_scale ?? 7);
+        setImgWidth(cfg.width ?? 512);
+        setImgHeight(cfg.height ?? 512);
+        setImgSeed(cfg.seed ?? -1);
+        break;
+      case 'tts':
+        setTtsSpeed(cfg.speed ?? 1.0);
+        break;
+      case 'mesh3d':
+        setMesh3dSteps(cfg.steps ?? 64);
+        setMesh3dGuidance(cfg.guidance_scale ?? 15);
+        setMesh3dSeed(cfg.seed ?? -1);
+        setMesh3dTexture(cfg.texture ?? true);
+        break;
+      default:
+        break;
+    }
+  };
+
+  // Single load path shared by the card "Load" button and the Configure
+  // sidebar. `overrideSettings` (from the sidebar) is persisted onto the card
+  // so a later card-load uses the same values. Load-time options come from the
+  // settings; generation defaults are pushed into the studios via
+  // applyModelDefaults.
+  const loadCardModel = async (card, overrideSettings) => {
+    const s = overrideSettings ?? card.settings ?? {};
+    const contextSize = card.max_context_size
+      ? Math.min(s.context_size ?? 4096, card.max_context_size)
+      : (s.context_size ?? 4096);
+    const mmproj = s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || undefined;
+    const modelId = await handleLoadModel({
+      model_path: card.modelPath,
+      gpu_layers: s.gpu_layers ?? 99,
+      context_size: contextSize,
+      mmproj_path: mmproj,
+    });
+    if (modelId) {
+      applyModelDefaults({ ...s, modality: card.modality });
+      setModelCards(current => current.map(item => item.id === card.id ? { ...item, settings: s, loadedModelId: modelId } : item));
+    }
+    return modelId;
+  };
+
   const handleUnloadModel = async (modelId) => {
     if (!modelId) return;
     setUnloadingModelId(modelId);
@@ -729,12 +972,24 @@ export default function App() {
 
   const selectedModel = loadedModels.find(model => model.model_id === selectedModelId) ?? null;
   const selectedCatalogModel = detectedModels.find(model => model.path === selectedModel?.model_path);
-  const acceptsImageInput = selectedCatalogModel?.image_input_available === true;
+  const acceptsImageInput = selectedModel?.image_input_available === true || selectedCatalogModel?.image_input_available === true;
+  const cfgModality = configTarget?.modality || 'text';
   const openModelStudio = (model) => {
-    const modalityMap = { vision: 'chat', tts: 'audio', text: 'chat' };
+    const modalityMap = { vision: 'chat', tts: 'audio', text: 'chat', mesh3d: 'mesh3d' };
     const studio = modalityMap[model.modality] ?? model.modality;
-    setActiveTab(['chat', 'image', 'audio', 'video'].includes(studio) ? studio : 'chat');
+    setActiveTab(['chat', 'image', 'audio', 'video', 'mesh3d'].includes(studio) ? studio : 'chat');
   };
+  // Most recently opened loaded model with modality "mesh3d" drives which
+  // input kinds the 3D Model Studio panel adapts to.
+  const activeMesh3dStudio = openStudios.filter(studio => studio.modality === 'mesh3d').slice(-1)[0];
+  const activeMesh3dLoaded = activeMesh3dStudio ? loadedModels.find(model => model.model_id === activeMesh3dStudio.modelId) : null;
+  const activeMesh3dCatalog = activeMesh3dLoaded ? detectedModels.find(model => model.path === activeMesh3dLoaded.model_path) : null;
+  const mesh3dAvailableKinds = activeMesh3dLoaded?.mesh_input_kinds?.length
+    ? activeMesh3dLoaded.mesh_input_kinds
+    : (activeMesh3dCatalog?.mesh_input_kinds?.length ? activeMesh3dCatalog.mesh_input_kinds : ['text', 'image', 'multi_image']);
+  useEffect(() => {
+    if (!mesh3dAvailableKinds.includes(mesh3dInputKind)) setMesh3dInputKind(mesh3dAvailableKinds[0]);
+  }, [mesh3dAvailableKinds.join(','), mesh3dInputKind]);
   const startStudio = (loadedEntry, catalogModel) => {
     const modality = catalogModel?.modality ?? loadedEntry?.modality ?? 'text';
     const modelName = catalogModel?.name ?? loadedEntry.model_path?.split('\\').pop() ?? 'Local model';
@@ -835,27 +1090,27 @@ export default function App() {
     return () => { clearInterval(interval); document.removeEventListener('visibilitychange', onVisibility); };
   }, []);
 
-  const handleSendMessage = async () => {
-    if ((!inputPrompt.trim() && attachments.length === 0) || isGenerating) return;
-
-    const userText = inputPrompt.trim();
-    setInputPrompt('');
-
-    const aiId = 'ai-' + Date.now();
-    const userMsg = { id: 'u-' + Date.now(), role: 'user', content: userText, attachments };
-    const tempAiMsg = { id: aiId, role: 'assistant', content: '', loading: true };
-
-    syncMessages(prev => [...prev, userMsg, tempAiMsg]);
-    setIsGenerating(true);
-    setAttachments([]);
-
+  // Shared fetch+SSE-parsing core, reused by both a fresh user send and a
+  // resumed request after the user picks a model from a model_choice prompt.
+  const streamAssistantResponse = async (requestBody, aiId, titleText) => {
     // Accumulators for the two phases
     let thinkingBuf = '';
     let answerBuf = '';
     let inThinkingPhase = true; // reasoning_content comes before content
     let tokenCount = 0;
     let finishReason = null;
+    let gotModelChoice = false;
     const startTime = Date.now();
+    // Polling intervals for delegated tool jobs (run_model), keyed by job_id.
+    // Cleared on tool_result, terminal progress status, and stream end/error.
+    const jobIntervals = new Map();
+    const stopJobPolling = (jobId) => {
+      const interval = jobIntervals.get(jobId);
+      if (interval) {
+        clearInterval(interval);
+        jobIntervals.delete(jobId);
+      }
+    };
 
     const updateMsg = (done = false) => {
       const elapsed = (Date.now() - startTime) / 1000;
@@ -879,17 +1134,7 @@ export default function App() {
       const res = await fetch('http://127.0.0.1:8080/v1/chat/completions/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: modelPath,
-          model_id: selectedModelId,
-          messages: [{ role: 'user', content: attachments.length ? [
-            { type: 'text', text: userText },
-            ...attachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.dataUrl } })),
-          ] : userText }],
-          max_tokens: 4096,
-          temperature: parseFloat(temperature),
-          top_p: parseFloat(topP),
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -914,16 +1159,46 @@ export default function App() {
           try {
             const chunk = JSON.parse(raw);
 
+            if (chunk.type === 'model_choice') {
+              // Keep the assistant bubble — it holds the reasoning and the
+              // list_models tool call. Just stop its spinner and remember
+              // which message to continue into once the user picks a model.
+              gotModelChoice = true;
+              syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: false } : m));
+              setPendingModelChoice({ options: chunk.options, requestBody, aiId });
+              continue;
+            }
+
             if (chunk.type === 'tool_status') {
+              const jobId = chunk.job_id || null;
               syncMessages(prev => prev.map(m =>
                 m.id === aiId
-                  ? { ...m, toolEvents: [...(m.toolEvents || []), { name: chunk.tool_name, status: 'executing' }] }
+                  ? { ...m, toolEvents: [...(m.toolEvents || []), { name: chunk.tool_name, status: 'executing', jobId, progress: null }] }
                   : m
               ));
+              if (jobId) {
+                const interval = setInterval(() => {
+                  fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/progress`)
+                    .then(res => (res.ok ? res.json() : null))
+                    .then(record => {
+                      if (!record) return;
+                      syncMessages(prev => prev.map(m => {
+                        if (m.id !== aiId) return m;
+                        const events = (m.toolEvents || []).map(e => (e.jobId === jobId ? { ...e, progress: record } : e));
+                        return { ...m, toolEvents: events };
+                      }));
+                      if (record.status === 'done' || record.status === 'error') stopJobPolling(jobId);
+                    })
+                    .catch(() => {});
+                }, 200);
+                jobIntervals.set(jobId, interval);
+              }
               continue;
             }
 
             if (chunk.type === 'tool_result') {
+              if (chunk.job_id) stopJobPolling(chunk.job_id);
+
               const mediaResult = chunk.media_url ? {
                 url: `http://127.0.0.1:8080${chunk.media_url}`,
                 type: chunk.media_type || 'application/octet-stream',
@@ -940,6 +1215,8 @@ export default function App() {
                   name: chunk.tool_name,
                   status: chunk.is_error ? 'error' : 'done',
                   detail: chunk.is_error ? chunk.content : null,
+                  jobId: chunk.job_id || null,
+                  progress: null,
                 };
                 if (idx >= 0) events[idx] = resolved; else events.push(resolved);
 
@@ -980,10 +1257,12 @@ export default function App() {
         }
       }
 
+      if (gotModelChoice) return;
+
       // Stream finished — mark done
       updateMsg(true);
-      if (activeChatId && chatSessions.find(item => item.id === activeChatId)?.title === 'New chat') {
-        generateChatTitle(activeChatId, userText);
+      if (titleText && activeChatId && chatSessions.find(item => item.id === activeChatId)?.title === 'New chat') {
+        generateChatTitle(activeChatId, titleText);
       }
     } catch (err) {
       syncMessages(prev =>
@@ -994,14 +1273,63 @@ export default function App() {
         )
       );
     } finally {
+      jobIntervals.forEach(interval => clearInterval(interval));
+      jobIntervals.clear();
       setIsGenerating(false);
     }
   };
 
+  const handleSendMessage = async () => {
+    if ((!inputPrompt.trim() && attachments.length === 0) || isGenerating) return;
+
+    const userText = inputPrompt.trim();
+    setInputPrompt('');
+
+    const aiId = 'ai-' + Date.now();
+    const imageAttachments = attachments.filter(a => a.type?.startsWith('image/'));
+    const userMsg = { id: 'u-' + Date.now(), role: 'user', content: userText, attachments };
+    const tempAiMsg = { id: aiId, role: 'assistant', content: '', loading: true };
+
+    syncMessages(prev => [...prev, userMsg, tempAiMsg]);
+    setIsGenerating(true);
+    setAttachments([]);
+
+    const requestBody = {
+      model: modelPath,
+      model_id: selectedModelId,
+      messages: [{ role: 'user', content: imageAttachments.length ? [
+        { type: 'text', text: userText },
+        ...imageAttachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.dataUrl } })),
+      ] : userText }],
+      max_tokens: 4096,
+      temperature: parseFloat(temperature),
+      top_p: parseFloat(topP),
+      autopilot,
+    };
+
+    await streamAssistantResponse(requestBody, aiId, userText);
+  };
+
+  const handlePickModel = async (option) => {
+    if (!pendingModelChoice) return;
+    const { requestBody, aiId } = pendingModelChoice;
+    setPendingModelChoice(null);
+
+    // Continue streaming the chosen model's result INTO the same assistant
+    // message so the earlier reasoning and tool call stay visible.
+    syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: true } : m));
+    setIsGenerating(true);
+
+    await streamAssistantResponse({ ...requestBody, forced_model: option.model }, aiId, null);
+  };
+
   const addAttachments = async (files) => {
-    if (!acceptsImageInput) return;
-    const imageFiles = Array.from(files).filter(file => file.type.startsWith('image/'));
-    const accepted = await Promise.all(imageFiles.slice(0, 4).map(file => new Promise(resolve => {
+    // Images require an image-input backend and feed the model; mesh files are
+    // preview-only (rendered in the viewer, never sent as model input).
+    const picked = Array.from(files).filter(file =>
+      (acceptsImageInput && file.type.startsWith('image/')) || isMeshResource(file.type, file.name)
+    );
+    const accepted = await Promise.all(picked.slice(0, 4).map(file => new Promise(resolve => {
       const reader = new FileReader();
       reader.onload = () => resolve({ name: file.name, type: file.type, dataUrl: reader.result });
       reader.readAsDataURL(file);
@@ -1009,15 +1337,54 @@ export default function App() {
     setAttachments(current => [...current, ...accepted]);
   };
 
+  // Fires a generation request while polling GET /v1/jobs/:id/progress every
+  // ~200ms on a separate timer (no await in between), so the progress bar
+  // updates concurrently with the non-streaming generation fetch.
+  const runGenerationJob = async (url, body, setProgress) => {
+    const jobId = crypto.randomUUID();
+    const fetchPromise = fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, job_id: jobId }),
+    });
+    const interval = setInterval(() => {
+      fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/progress`)
+        .then(res => (res.ok ? res.json() : null))
+        .then(record => { if (record) setProgress(record); })
+        .catch(() => {});
+    }, 200);
+    try {
+      const res = await fetchPromise;
+      if (!res.ok) {
+        const text = (await res.text()).trim();
+        let message = text;
+        try {
+          const parsed = JSON.parse(text);
+          message = parsed?.error || parsed?.message || text;
+        } catch {
+          // plain-text error body, use as-is
+        }
+        throw new Error(message);
+      }
+      return await res.json();
+    } finally {
+      clearInterval(interval);
+      setProgress(null);
+    }
+  };
+
   const handleGenerateImage = async () => {
     setIsGeneratingImg(true);
     try {
-      const res = await fetch('http://127.0.0.1:8080/v1/images/generations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: imgPrompt })
-      });
-      const data = await res.json();
+      const data = await runGenerationJob('http://127.0.0.1:8080/v1/images/generations', {
+        prompt: imgPrompt,
+        negative_prompt: imgNegativePrompt,
+        steps: Number(imgSteps),
+        cfg_scale: Number(imgCfgScale),
+        width: Number(imgWidth),
+        height: Number(imgHeight),
+        seed: Number(imgSeed),
+      }, setImgProgress);
       if (data?.data?.[0]?.b64_json) {
         setImgSrc('data:image/png;base64,' + data.data[0].b64_json);
       }
@@ -1028,15 +1395,78 @@ export default function App() {
     }
   };
 
+  const handleDownloadImage = async () => {
+    if (!imgSrc) return;
+    const blob = await (await fetch(imgSrc)).blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `image-${Date.now()}.png`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadMedia = async (url, type) => {
+    if (!url) return;
+    const blob = await (await fetch(url)).blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const ext = type?.split('/')[1]?.split(';')[0] || 'bin';
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = `generated-${Date.now()}.${ext}`;
+    link.click();
+    URL.revokeObjectURL(objectUrl);
+  };
+
+  const handleMesh3dSingleImage = (files) => {
+    const file = files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setMesh3dImages([{ name: file.name, dataUrl: reader.result }]);
+    reader.readAsDataURL(file);
+  };
+
+  const handleMesh3dMultiImages = async (files) => {
+    const accepted = await Promise.all(Array.from(files).map(file => new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onload = () => resolve({ name: file.name, dataUrl: reader.result });
+      reader.readAsDataURL(file);
+    })));
+    setMesh3dImages(current => [...current, ...accepted]);
+  };
+
+  const handleGenerateMesh3d = async () => {
+    setIsGeneratingMesh(true);
+    try {
+      const body = {
+        prompt: mesh3dPrompt,
+        input_kind: mesh3dInputKind,
+        steps: Number(mesh3dSteps),
+        guidance_scale: Number(mesh3dGuidance),
+        seed: Number(mesh3dSeed),
+        output_format: mesh3dFormat,
+        texture: mesh3dTexture,
+      };
+      if (mesh3dInputKind !== 'text') {
+        body.images = mesh3dImages.map(img => img.dataUrl.split(',')[1]);
+      }
+      const data = await runGenerationJob('http://127.0.0.1:8080/v1/models3d/generations', body, setMeshProgress);
+      if (data?.mesh_base64) {
+        setMesh3dResult({ base64: data.mesh_base64, format: data.format || mesh3dFormat });
+      }
+    } catch (e) {
+      alert('3D mesh generation error: ' + e);
+    } finally {
+      setIsGeneratingMesh(false);
+    }
+  };
+
   const handleSynthesizeSpeech = async () => {
     setIsGeneratingTts(true);
     try {
-      const res = await fetch('http://127.0.0.1:8080/v1/audio/speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'kokoro', input: ttsInput })
-      });
-      const data = await res.json();
+      const data = await runGenerationJob('http://127.0.0.1:8080/v1/audio/speech', {
+        model: 'kokoro', input: ttsInput, speed: Number(ttsSpeed),
+      }, setTtsProgress);
       if (data?.audio_b64) {
         setAudioSrc('data:audio/wav;base64,' + data.audio_b64);
       }
@@ -1056,6 +1486,12 @@ export default function App() {
   const freeVram = parseFloat(sysInfo.free_vram_gb) || 6.0;
   const usedVram = totalVram - freeVram;
   const vramPct = Math.min(100, Math.max(0, (usedVram / totalVram) * 100)).toFixed(0);
+
+  const activeDownloadCount = Object.values(hfDownloads).filter(d => d.status === 'downloading').length;
+  const sortedDownloads = Object.entries(hfDownloads).sort(([, a], [, b]) => {
+    const rank = s => s === 'downloading' ? 0 : 1;
+    return rank(a.status) - rank(b.status);
+  });
 
   return (
     <div className="desktop-app">
@@ -1090,8 +1526,85 @@ export default function App() {
             <div className="status-dot"></div>
             <span>CUDA GPU Active</span>
           </div>
+
+          <button className="downloads-tracker-btn" onClick={() => setShowDownloadsPanel(current => !current)} title="Downloads">
+            <Download size={14} />
+            <span>Downloads</span>
+            {activeDownloadCount > 0 && <span className="downloads-tracker-badge">{activeDownloadCount}</span>}
+          </button>
         </div>
       </header>
+
+      {showDownloadsPanel && (
+        <>
+          <div className="downloads-tracker-backdrop" onClick={() => setShowDownloadsPanel(false)} />
+          <div className="downloads-tracker-panel">
+            <div className="modal-header">
+              <h3>Downloads</h3>
+              <button className="config-sidebar-close" onClick={() => setShowDownloadsPanel(false)} title="Close">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="downloads-tracker-list">
+              {sortedDownloads.length === 0 && (
+                <div className="hf-empty-state">
+                  <Download size={22} />
+                  <p>No downloads yet.</p>
+                </div>
+              )}
+              {sortedDownloads.map(([filename, download]) => {
+                const hasTotal = download.total_bytes != null && download.total_bytes > 0;
+                const progressPct = hasTotal ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100) : 0;
+                return (
+                  <div key={filename} className="hf-file-row">
+                    <div className="hf-file-info">
+                      <div className="hf-file-name-row">
+                        <span className="hf-file-name">{filename}</span>
+                      </div>
+                      {download.repo && <span className="modal-list-item-meta">{download.repo}</span>}
+                      {hasTotal ? (
+                        <>
+                          <div className="hf-progress-bar">
+                            <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                          </div>
+                          <span className="hf-progress-text">
+                            {formatFileSize(download.downloaded_bytes)} / {formatFileSize(download.total_bytes)}
+                          </span>
+                        </>
+                      ) : (
+                        download.status === 'downloading' && (
+                          <span className="hf-progress-text">{formatFileSize(download.downloaded_bytes)} downloaded</span>
+                        )
+                      )}
+                      {download.status === 'error' && (
+                        <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Failed{download.error ? `: ${download.error}` : ''}</span>
+                      )}
+                      {download.status === 'complete' && (
+                        <span className="modal-list-item-meta" style={{ color: 'var(--accent-green)' }}>Complete</span>
+                      )}
+                      {download.status === 'cancelled' && (
+                        <span className="modal-list-item-meta">Cancelled</span>
+                      )}
+                    </div>
+                    <div className="hf-file-actions">
+                      {download.status === 'downloading' && (
+                        <button className="hf-cancel-btn" onClick={() => cancelHfDownload(filename)} title="Cancel download">
+                          <X size={14} />
+                        </button>
+                      )}
+                      {download.repo && (
+                        <button className="hf-download-btn" onClick={() => jumpToCatalogEntry(download.repo, filename)}>
+                          Find in catalog
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Main Content Body */}
       <div className="app-container">
@@ -1456,21 +1969,34 @@ export default function App() {
                               {event.status === 'done' && `Used tool: ${event.name}`}
                               {event.status === 'error' && `Tool ${event.name} failed: ${event.detail}`}
                             </span>
+                            {event.progress && <GenProgressBar progress={event.progress} />}
                           </div>
                         ))}
-                        {msg.mediaResults?.map((media, idx) => (
-                          <div key={idx} className="tool-media-result">
-                            {media.type?.startsWith('audio/') && (
-                              <audio controls autoPlay src={media.url} style={{ width: '100%' }} />
-                            )}
-                            {media.type?.startsWith('image/') && (
-                              <img src={media.url} alt="Generated" className="tool-media-image" />
-                            )}
-                            {media.type?.startsWith('video/') && (
-                              <video controls src={media.url} style={{ width: '100%', borderRadius: '8px' }} />
-                            )}
-                          </div>
-                        ))}
+                        {msg.mediaResults?.map((media, idx) => {
+                          if (isMeshResource(media.type, media.url)) {
+                            return (
+                              <div key={idx} className="tool-media-result">
+                                <Mesh3DViewer url={media.url} format={guessMeshFormat(media.url)} />
+                              </div>
+                            );
+                          }
+                          return (
+                            <div key={idx} className="tool-media-result">
+                              {media.type?.startsWith('audio/') && (
+                                <audio controls autoPlay src={media.url} style={{ width: '100%' }} />
+                              )}
+                              {media.type?.startsWith('image/') && (
+                                <img src={media.url} alt="Generated" className="tool-media-image" />
+                              )}
+                              {media.type?.startsWith('video/') && (
+                                <video controls src={media.url} style={{ width: '100%', borderRadius: '8px' }} />
+                              )}
+                              <button type="button" className="tool-media-download-btn" onClick={() => handleDownloadMedia(media.url, media.type)} title="Download">
+                                <Download size={12} /> Download
+                              </button>
+                            </div>
+                          );
+                        })}
                         {msg.telemetry && (
                           <div className="meta-info">
                             <span className="tag-speed"><Zap size={11} /> {msg.telemetry}</span>
@@ -1490,10 +2016,27 @@ export default function App() {
                       <button onClick={() => setAttachments(current => current.filter(item => item.dataUrl !== attachment.dataUrl))} title={`Remove ${attachment.name}`}><X size={13} /></button>
                     </div>)}
                   </div>}
+                  {pendingModelChoice && <div className="composer-model-choice">
+                    <div className="composer-model-choice-header">
+                      <span>Choose a model:</span>
+                      <button className="btn-dismiss-choice" onClick={() => setPendingModelChoice(null)} title="Dismiss"><X size={13} /></button>
+                    </div>
+                    <div className="composer-model-choice-options">
+                      {pendingModelChoice.options.map(option => (
+                        <button key={option.model} className="model-choice-option" onClick={() => handlePickModel(option)}>
+                          <span className="model-choice-name">{option.model}</span>
+                          <span className="model-choice-modality">{option.modality}{option.loaded ? ' · loaded' : ''}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>}
                   <div className="prompt-area">
-                    <input ref={attachmentInputRef} type="file" accept="image/*" multiple hidden onChange={event => { addAttachments(event.target.files); event.target.value = ''; }} />
-                    <button className="btn-attach" onClick={() => attachmentInputRef.current?.click()} disabled={!acceptsImageInput} title={acceptsImageInput ? 'Attach image' : 'The selected model does not have an available image-input backend'}>
+                    <input ref={attachmentInputRef} type="file" accept="image/*,.glb,.gltf,.obj,.fbx,.ply,.stl" multiple hidden onChange={event => { addAttachments(event.target.files); event.target.value = ''; }} />
+                    <button className="btn-attach" onClick={() => attachmentInputRef.current?.click()} title={acceptsImageInput ? 'Attach an image or 3D model' : 'Attach a 3D model (image input needs an image-capable model)'}>
                       <Paperclip size={18} />
+                    </button>
+                    <button className={`btn-toggle-controls ${autopilot ? 'active' : ''}`} onClick={() => setAutopilot(v => !v)} title="Autopilot: let the model pick among compatible models automatically">
+                      <Wand2 size={16} /> Autopilot
                     </button>
                     <textarea
                       value={inputPrompt}
@@ -1549,18 +2092,14 @@ export default function App() {
                         </div>
                         <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{card.modality?.toUpperCase()} · {(card.size_bytes / 1e9).toFixed(2)} GB</div>
                         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.25rem' }}>
-                          <button className="btn-load-model" onClick={() => openConfigPanel({ name: card.name, path: card.modelPath, max_context_size: card.max_context_size, mmproj_path: card.mmproj_path })}>
+                          <button className="btn-load-model" onClick={() => openConfigPanel(card)}>
                             <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
                           </button>
                           {isLoaded ? <button className="btn-unload-model" onClick={async () => {
                             await handleUnloadModel(card.loadedModelId);
                             setModelCards(current => current.map(item => item.id === card.id ? { ...item, loadedModelId: null } : item));
                           }} disabled={unloadingModelId === card.loadedModelId}><Power size={14} /> Eject</button>
-                          : <button className="btn-load-model" onClick={async () => {
-                            const configuration = { model_path: card.modelPath, gpu_layers: 99, context_size: Math.min(4096, card.max_context_size ?? 4096), mmproj_path: card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || undefined };
-                            const modelId = await handleLoadModel(configuration);
-                            if (modelId) setModelCards(current => current.map(item => item.id === card.id ? { ...item, loadedModelId: modelId } : item));
-                          }} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
+                          : <button className="btn-load-model" onClick={() => loadCardModel(card)} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
                           {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, card)} title="Start studio"><Play size={14} /></button>}
                         </div>
                       </div>
@@ -1617,12 +2156,16 @@ export default function App() {
                                   max_context_size: model.max_context_size ?? null,
                                   image_input_available: model.image_input_available === true,
                                   mmproj_path: model.mmproj_path || null,
+                                  settings: {},
                                 }]);
                                 closeModelPicker();
                               }}
                             >
                               <strong>{model.name}</strong>
-                              <span className="modal-list-item-meta">{model.modality?.toUpperCase()} · {(model.size_bytes / 1e9).toFixed(2)} GB</span>
+                              <span className="modal-list-item-meta">
+                                {model.modality?.toUpperCase()}
+                                <span className="hf-param-badge">{(model.size_bytes / 1e9).toFixed(2)} GB</span>
+                              </span>
                             </button>
                           ))}
                         {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in AIATM's models folder.</p>}
@@ -1852,6 +2395,13 @@ export default function App() {
                               <div className="hf-detail-header">
                                 <div className="hf-detail-title">
                                   <strong>{selected?.modelId || hfSelectedRepo}</strong>
+                                  <button
+                                    className="hf-detail-link"
+                                    title="Open on Hugging Face"
+                                    onClick={() => window.require('electron').shell.openExternal(`https://huggingface.co/${hfSelectedRepo}`)}
+                                  >
+                                    <ArrowUpRight size={14} />
+                                  </button>
                                   {formatParamCount(selected?.params) && (
                                     <span className="hf-param-badge">{formatParamCount(selected.params)}</span>
                                   )}
@@ -1892,62 +2442,97 @@ export default function App() {
                                   <div className="hf-files-list">
                                     <div className="hf-file-row hf-file-row-all">
                                       <div className="modal-list-item-meta">Download every file into a per-model folder</div>
-                                      <button className="hf-download-btn" onClick={() => startHfDownloadAll(hfSelectedRepo)}>
-                                        <Download size={14} /> Download all files
-                                      </button>
+                                      <div className="hf-file-actions">
+                                        {['sharded', 'variants', 'components'].includes(hfRepoKind) && hfAutodownload.length > 0 && (
+                                          <button className="hf-download-btn hf-autodownload-btn" onClick={() => startHfAutodownload(hfSelectedRepo)}>
+                                            <Download size={14} /> Autodownload
+                                          </button>
+                                        )}
+                                        <button className="hf-download-btn" onClick={() => startHfDownloadAll(hfSelectedRepo)}>
+                                          <Download size={14} /> Download all files
+                                        </button>
+                                      </div>
                                     </div>
-                                    {hfRepoFiles.map(file => {
-                                      const download = hfDownloads[file.filename];
-                                      const progressPct = download && download.total_bytes > 0
-                                        ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
-                                        : 0;
-                                      return (
-                                        <div key={file.filename} className="hf-file-row">
-                                          <div className="hf-file-info">
-                                            <div className="hf-file-name-row">
-                                              <span className="hf-file-name">{file.filename}</span>
-                                              {file.size != null && <span className="hf-file-size">{formatFileSize(file.size)}</span>}
-                                            </div>
-                                            {download && download.status === 'downloading' && (
-                                              <>
-                                                <div className="hf-progress-bar">
-                                                  <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                                    {hfAutodownloadReason && (
+                                      <div className="hf-autodownload-reason">{hfAutodownloadReason}</div>
+                                    )}
+                                    {(() => {
+                                      const groups = new Map();
+                                      hfRepoFiles.forEach(file => {
+                                        const slashIdx = file.filename.lastIndexOf('/');
+                                        const dir = slashIdx === -1 ? '' : file.filename.slice(0, slashIdx);
+                                        if (!groups.has(dir)) groups.set(dir, []);
+                                        groups.get(dir).push(file);
+                                      });
+                                      return Array.from(groups.entries()).map(([dir, files]) => {
+                                        const depth = dir === '' ? 0 : dir.split('/').length;
+                                        return (
+                                          <div key={dir || '__root__'} className="hf-folder-group">
+                                            {dir !== '' && (
+                                              <div className="hf-folder-header" style={{ paddingLeft: `${(depth - 1) * 1.1}rem` }}>
+                                                {dir}/
+                                              </div>
+                                            )}
+                                            {files.map(file => {
+                                              const download = hfDownloads[file.filename];
+                                              const progressPct = download && download.total_bytes > 0
+                                                ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
+                                                : 0;
+                                              const roleInfo = getHfFileRoleInfo(file);
+                                              const baseName = dir === '' ? file.filename : file.filename.slice(dir.length + 1);
+                                              return (
+                                                <div key={file.filename} className="hf-file-row" data-filename={file.filename} style={{ paddingLeft: `${depth * 1.1}rem` }}>
+                                                  <div className="hf-file-info">
+                                                    <div className="hf-file-name-row">
+                                                      <span className="hf-file-role" title={roleInfo.tooltip}>{roleInfo.icon}</span>
+                                                      <span className="hf-file-name">{baseName}</span>
+                                                      {file.size != null && <span className="hf-file-size">{formatFileSize(file.size)}</span>}
+                                                      {file.quant && <span className="hf-file-quant">{file.quant}</span>}
+                                                    </div>
+                                                    {download && download.status === 'downloading' && (
+                                                      <>
+                                                        <div className="hf-progress-bar">
+                                                          <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                                                        </div>
+                                                        <div className="hf-progress-row">
+                                                          <span className="hf-progress-text">
+                                                            {formatFileSize(download.downloaded_bytes)} / {formatFileSize(download.total_bytes)}
+                                                          </span>
+                                                          <button
+                                                            className="hf-cancel-btn"
+                                                            onClick={() => cancelHfDownload(file.filename)}
+                                                            title="Cancel download"
+                                                          >
+                                                            <X size={12} />
+                                                          </button>
+                                                        </div>
+                                                      </>
+                                                    )}
+                                                    {download && download.status === 'error' && (
+                                                      <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
+                                                    )}
+                                                  </div>
+                                                  <div className="hf-file-actions">
+                                                    {download && download.status === 'complete' ? (
+                                                      <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
+                                                    ) : (
+                                                      <button
+                                                        className="hf-download-btn"
+                                                        disabled={download?.status === 'downloading'}
+                                                        onClick={() => startHfDownload(hfSelectedRepo, file.filename)}
+                                                      >
+                                                        {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
+                                                        {download?.status === 'downloading' ? 'Downloading' : 'Download'}
+                                                      </button>
+                                                    )}
+                                                  </div>
                                                 </div>
-                                                <div className="hf-progress-row">
-                                                  <span className="hf-progress-text">
-                                                    {formatFileSize(download.downloaded_bytes)} / {formatFileSize(download.total_bytes)}
-                                                  </span>
-                                                  <button
-                                                    className="hf-cancel-btn"
-                                                    onClick={() => cancelHfDownload(file.filename)}
-                                                    title="Cancel download"
-                                                  >
-                                                    <X size={12} />
-                                                  </button>
-                                                </div>
-                                              </>
-                                            )}
-                                            {download && download.status === 'error' && (
-                                              <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
-                                            )}
+                                              );
+                                            })}
                                           </div>
-                                          <div className="hf-file-actions">
-                                            {download && download.status === 'complete' ? (
-                                              <span className="hf-download-btn hf-download-done"><Check size={14} /> Done</span>
-                                            ) : (
-                                              <button
-                                                className="hf-download-btn"
-                                                disabled={download?.status === 'downloading'}
-                                                onClick={() => startHfDownload(hfSelectedRepo, file.filename)}
-                                              >
-                                                {download?.status === 'downloading' ? <Loader size={14} className="spin" /> : <Download size={14} />}
-                                                {download?.status === 'downloading' ? 'Downloading' : 'Download'}
-                                              </button>
-                                            )}
-                                          </div>
-                                        </div>
-                                      );
-                                    })}
+                                        );
+                                      });
+                                    })()}
                                   </div>
                                 )}
                               </div>
@@ -1977,9 +2562,36 @@ export default function App() {
                   <div className="slider-header"><div><strong>Model status refresh</strong><div className="slider-hint">How often AIATM checks loaded models.</div></div><span className="badge-value">{appSettings.refreshSeconds}s</span></div>
                   <input className="control-slider" type="range" min="1" max="10" step="1" value={appSettings.refreshSeconds} onChange={e => setAppSettings(current => ({ ...current, refreshSeconds: Number(e.target.value) }))} />
                 </div>
-                <div className="slider-header" style={{ paddingTop: '1rem' }}>
+                <div className="slider-header" style={{ padding: '1rem 0', borderBottom: '1px solid var(--border-color)' }}>
                   <div><strong>Show thought process panels</strong><div className="slider-hint">Display model reasoning when it is supplied in a response.</div></div>
                   <input type="checkbox" checked={appSettings.showThoughtProcess} onChange={e => setAppSettings(current => ({ ...current, showThoughtProcess: e.target.checked }))} />
+                </div>
+                <div className="slider-header" style={{ padding: '1rem 0', borderBottom: '1px solid var(--border-color)' }}>
+                  <div><strong>Autopilot (auto model-selection)</strong><div className="slider-hint">When on, the model picks among compatible models automatically instead of asking you.</div></div>
+                  <input type="checkbox" checked={appSettings.autopilot} onChange={e => setAppSettings(current => ({ ...current, autopilot: e.target.checked }))} />
+                </div>
+                <div className="slider-header" style={{ paddingTop: '1rem' }}>
+                  <div><strong>Generated media retention</strong><div className="slider-hint">How long generated images/audio/meshes are kept before being cleaned up. "Forever" saves generated assets to disk permanently.</div></div>
+                  <select
+                    className="control-select"
+                    value={`${appSettings.mediaRetention.ttl_seconds}:${appSettings.mediaRetention.persist_disk}`}
+                    onChange={e => {
+                      const [ttl, persist] = e.target.value.split(':');
+                      const mediaRetention = { ttl_seconds: Number(ttl), persist_disk: persist === 'true' };
+                      setAppSettings(current => ({ ...current, mediaRetention }));
+                      fetch('http://127.0.0.1:8080/v1/config/media-retention', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(mediaRetention),
+                      }).catch(() => {});
+                    }}
+                  >
+                    <option value="1800:false">30 minutes</option>
+                    <option value="3600:false">1 hour</option>
+                    <option value="21600:false">6 hours</option>
+                    <option value="86400:false">24 hours</option>
+                    <option value="0:true">Forever (save to disk)</option>
+                  </select>
                 </div>
               </div>
             </div>
@@ -2005,17 +2617,79 @@ export default function App() {
                   </div>
 
                   <div className="form-group">
-                    <label>Model Path</label>
-                    <input type="text" value="models/sd.safetensors" readOnly />
+                    <label>Negative Prompt</label>
+                    <input
+                      type="text"
+                      value={imgNegativePrompt}
+                      onChange={e => setImgNegativePrompt(e.target.value)}
+                    />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '1rem' }}>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Steps</label>
+                      <input
+                        type="number"
+                        value={imgSteps}
+                        onChange={e => setImgSteps(e.target.value)}
+                      />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>CFG Scale</label>
+                      <input
+                        type="number"
+                        step="0.5"
+                        value={imgCfgScale}
+                        onChange={e => setImgCfgScale(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '1rem' }}>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Width</label>
+                      <input
+                        type="number"
+                        step="64"
+                        value={imgWidth}
+                        onChange={e => setImgWidth(e.target.value)}
+                      />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Height</label>
+                      <input
+                        type="number"
+                        step="64"
+                        value={imgHeight}
+                        onChange={e => setImgHeight(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="form-group">
+                    <label>Seed <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(-1 = random)</span></label>
+                    <input
+                      type="number"
+                      value={imgSeed}
+                      onChange={e => setImgSeed(e.target.value)}
+                    />
                   </div>
 
                   <button className="btn-primary" onClick={handleGenerateImage} disabled={isGeneratingImg}>
                     <Sparkles size={16} /> {isGeneratingImg ? 'Rendering...' : 'Generate Image'}
                   </button>
+                  {isGeneratingImg && <GenProgressBar progress={imgProgress} />}
                 </div>
 
                 <div className="card">
-                  <label>Generated Canvas Output</label>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <label>Generated Canvas Output</label>
+                    {imgSrc && (
+                      <button type="button" className="image-download-btn" onClick={handleDownloadImage} title="Download image">
+                        <Download size={14} /> Download
+                      </button>
+                    )}
+                  </div>
                   <div className="preview-box">
                     {imgSrc ? (
                       <img src={imgSrc} alt="SD Output" />
@@ -2055,6 +2729,7 @@ export default function App() {
                   <button className="btn-primary" onClick={handleSynthesizeSpeech} disabled={isGeneratingTts}>
                     <Play size={16} /> {isGeneratingTts ? 'Synthesizing...' : 'Synthesize Speech'}
                   </button>
+                  {isGeneratingTts && <GenProgressBar progress={ttsProgress} />}
 
                   {audioSrc && <audio controls autoPlay src={audioSrc} style={{ width: '100%', marginTop: '1rem' }} />}
                 </div>
@@ -2095,6 +2770,161 @@ export default function App() {
             </div>
           )}
 
+          {/* 5. 3D Model Studio */}
+          {activeTab === 'mesh3d' && (
+            <div className="tab-panel">
+              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>3D Model Studio</h2>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+                Local text / image / multi-image → 3D mesh generation
+              </p>
+
+              <div className="grid-2">
+                <div className="card">
+                  {mesh3dAvailableKinds.length > 1 && (
+                    <div className="segmented-control">
+                      {mesh3dAvailableKinds.map(kind => (
+                        <button
+                          key={kind}
+                          type="button"
+                          className={`segmented-btn ${mesh3dInputKind === kind ? 'active' : ''}`}
+                          onClick={() => setMesh3dInputKind(kind)}
+                        >
+                          {kind === 'text' ? 'Text' : kind === 'image' ? 'Image' : 'Multi-Image'}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {mesh3dInputKind === 'text' && (
+                    <div className="form-group">
+                      <label>Prompt</label>
+                      <textarea
+                        rows={4}
+                        style={{ height: 'auto' }}
+                        value={mesh3dPrompt}
+                        onChange={e => setMesh3dPrompt(e.target.value)}
+                      />
+                    </div>
+                  )}
+
+                  {mesh3dInputKind === 'image' && (
+                    <div className="form-group">
+                      <label>Source Image</label>
+                      <input
+                        ref={mesh3dImageInputRef}
+                        type="file"
+                        accept="image/*"
+                        style={{ display: 'none' }}
+                        onChange={e => { handleMesh3dSingleImage(e.target.files); e.target.value = ''; }}
+                      />
+                      {mesh3dImages[0] ? (
+                        <div className="mesh3d-dropzone-thumb">
+                          <img src={mesh3dImages[0].dataUrl} alt={mesh3dImages[0].name} />
+                          <button type="button" className="mesh3d-thumb-remove" onClick={() => setMesh3dImages([])} title="Remove"><X size={12} /></button>
+                          <button type="button" className="mesh3d-dropzone-replace" onClick={() => mesh3dImageInputRef.current?.click()}>Replace</button>
+                        </div>
+                      ) : (
+                        <div className="mesh3d-dropzone" onClick={() => mesh3dImageInputRef.current?.click()}>
+                          <Paperclip size={20} />
+                          <span>Click to upload an image</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {mesh3dInputKind === 'multi_image' && (
+                    <div className="form-group">
+                      <label>Source Images</label>
+                      <input
+                        ref={mesh3dMultiImageInputRef}
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        style={{ display: 'none' }}
+                        onChange={e => { handleMesh3dMultiImages(e.target.files); e.target.value = ''; }}
+                      />
+                      <div className="mesh3d-thumb-grid">
+                        {mesh3dImages.map((img, idx) => (
+                          <div key={idx} className="mesh3d-thumb-grid-item">
+                            <img src={img.dataUrl} alt={img.name} />
+                            <button type="button" className="mesh3d-thumb-remove" onClick={() => setMesh3dImages(current => current.filter((_, i) => i !== idx))} title="Remove"><X size={12} /></button>
+                          </div>
+                        ))}
+                        <div className="mesh3d-dropzone mesh3d-dropzone-add" onClick={() => mesh3dMultiImageInputRef.current?.click()}>
+                          <Paperclip size={18} />
+                          <span>Add images</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', gap: '1rem' }}>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Steps</label>
+                      <input
+                        type="number"
+                        value={mesh3dSteps}
+                        onChange={e => setMesh3dSteps(e.target.value)}
+                      />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Guidance Scale</label>
+                      <input
+                        type="number"
+                        step="0.5"
+                        value={mesh3dGuidance}
+                        onChange={e => setMesh3dGuidance(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '1rem' }}>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Seed <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(-1 = random)</span></label>
+                      <input
+                        type="number"
+                        value={mesh3dSeed}
+                        onChange={e => setMesh3dSeed(e.target.value)}
+                      />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Output Format</label>
+                      <select value={mesh3dFormat} onChange={e => setMesh3dFormat(e.target.value)}>
+                        <option value="glb">GLB</option>
+                        <option value="obj">OBJ</option>
+                        <option value="ply">PLY</option>
+                        <option value="stl">STL</option>
+                        <option value="fbx">FBX</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="slider-header" style={{ marginBottom: '1rem' }}>
+                    <div><strong>Texture</strong><div className="slider-hint">Generate a texture/material for the mesh.</div></div>
+                    <input type="checkbox" checked={mesh3dTexture} onChange={e => setMesh3dTexture(e.target.checked)} />
+                  </div>
+
+                  <button className="btn-primary" onClick={handleGenerateMesh3d} disabled={isGeneratingMesh}>
+                    <Boxes size={16} /> {isGeneratingMesh ? 'Generating...' : 'Generate 3D Model'}
+                  </button>
+                  {isGeneratingMesh && <GenProgressBar progress={meshProgress} />}
+                </div>
+
+                <div className="card">
+                  <label>Generated Mesh Output</label>
+                  {mesh3dResult ? (
+                    <Mesh3DViewer base64={mesh3dResult.base64} format={mesh3dResult.format} />
+                  ) : (
+                    <div className="preview-box mesh3d-empty-preview">
+                      <Boxes size={40} />
+                      <span>Generated 3D mesh will display here</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
         </main>
       </div>
 
@@ -2113,52 +2943,155 @@ export default function App() {
             </div>
             <div className="config-sidebar-body">
               <div className="sidebar-section">
-                <label className="section-label">GGUF model path</label>
+                <label className="section-label">Model path</label>
                 <input className="control-input" value={configTarget?.model_path || ''} onChange={e => setConfigTarget(current => ({ ...current, model_path: e.target.value }))} />
               </div>
-              <div className="sidebar-section">
-                <label className="section-label">Vision projector (mmproj)</label>
-                <div className="mmproj-row">
-                  <input className="control-input" value={configTarget?.mmproj_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mmproj_path: e.target.value }))} />
-                  <button className="btn-browse" onClick={() => mmprojInputRef.current?.click()}>Browse</button>
-                  <input
-                    ref={mmprojInputRef}
-                    type="file"
-                    accept=".gguf"
-                    style={{ display: 'none' }}
-                    onChange={e => {
-                      const file = e.target.files[0];
-                      if (file) setConfigTarget(current => ({ ...current, mmproj_path: file.path || '' }));
-                      e.target.value = '';
-                    }}
-                  />
+              {(cfgModality === 'text' || cfgModality === 'vision') && (
+                <div className="sidebar-section">
+                  <label className="section-label">Vision projector (mmproj)</label>
+                  <div className="mmproj-row">
+                    <input className="control-input" value={configTarget?.mmproj_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mmproj_path: e.target.value }))} />
+                    <button className="btn-browse" onClick={() => mmprojInputRef.current?.click()}>Browse</button>
+                    <input
+                      ref={mmprojInputRef}
+                      type="file"
+                      accept=".gguf"
+                      style={{ display: 'none' }}
+                      onChange={e => {
+                        const file = e.target.files[0];
+                        if (file) setConfigTarget(current => ({ ...current, mmproj_path: file.path || '' }));
+                        e.target.value = '';
+                      }}
+                    />
+                  </div>
+                  <div className="slider-hint">Auto-detected from the model directory. Leave empty if this is not a vision model.</div>
                 </div>
-                <div className="slider-hint">Auto-detected from model directory. Leave empty if not a vision model.</div>
-              </div>
-              <div className="sidebar-section">
-                <div className="slider-header"><label className="section-label">GPU layers</label><span className="badge-value">{configTarget?.gpu_layers ?? 99}</span></div>
-                <input className="control-slider" type="range" min="0" max="99" value={configTarget?.gpu_layers ?? 99} onChange={e => setConfigTarget(current => ({ ...current, gpu_layers: Number(e.target.value) }))} />
-              </div>
-              <div className="sidebar-section">
-                <div className="slider-header"><label className="section-label">Context window</label><span className="badge-value">{(configTarget?.context_size ?? 4096).toLocaleString()} / {configTarget?.max_context_size ? configTarget.max_context_size.toLocaleString() : '?'}</span></div>
-                {configTarget?.max_context_size ? <>
-                  <input className="control-slider" type="range" min="512" max={configTarget.max_context_size} step="512" value={Math.min(configTarget.context_size ?? 4096, configTarget.max_context_size)} onChange={e => setConfigTarget(current => ({ ...current, context_size: Number(e.target.value) }))} />
-                  <div className="slider-hint">Maximum read from this GGUF model’s metadata.</div>
-                </> : <div className="slider-hint">Maximum context is not present in this model’s metadata.</div>}
-              </div>
-              <div className="sidebar-section">
-                <div className="slider-header"><label className="section-label">Temperature</label><span className="badge-value">{configTarget?.temperature ?? 0.7}</span></div>
-                <input className="control-slider" type="range" min="0" max="1.5" step="0.05" value={configTarget?.temperature ?? 0.7} onChange={e => setConfigTarget(current => ({ ...current, temperature: Number(e.target.value) }))} />
-              </div>
-              <div className="sidebar-section">
-                <div className="slider-header"><label className="section-label">Top-P</label><span className="badge-value">{configTarget?.top_p ?? 0.9}</span></div>
-                <input className="control-slider" type="range" min="0.1" max="1" step="0.05" value={configTarget?.top_p ?? 0.9} onChange={e => setConfigTarget(current => ({ ...current, top_p: Number(e.target.value) }))} />
-              </div>
+              )}
+              {(cfgModality === 'text' || cfgModality === 'vision') && (
+                <>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">GPU layers</label><span className="badge-value">{configTarget?.gpu_layers ?? 99}</span></div>
+                    <input className="control-slider" type="range" min="0" max="99" value={configTarget?.gpu_layers ?? 99} onChange={e => setConfigTarget(current => ({ ...current, gpu_layers: Number(e.target.value) }))} />
+                  </div>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">Context window</label><span className="badge-value">{(configTarget?.context_size ?? 4096).toLocaleString()} / {configTarget?.max_context_size ? configTarget.max_context_size.toLocaleString() : '?'}</span></div>
+                    {configTarget?.max_context_size ? <>
+                      <input className="control-slider" type="range" min="512" max={configTarget.max_context_size} step="512" value={Math.min(configTarget.context_size ?? 4096, configTarget.max_context_size)} onChange={e => setConfigTarget(current => ({ ...current, context_size: Number(e.target.value) }))} />
+                      <div className="slider-hint">Maximum read from this GGUF model’s metadata.</div>
+                    </> : <div className="slider-hint">Maximum context is not present in this model’s metadata.</div>}
+                  </div>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">Temperature</label><span className="badge-value">{configTarget?.temperature ?? 0.7}</span></div>
+                    <input className="control-slider" type="range" min="0" max="1.5" step="0.05" value={configTarget?.temperature ?? 0.7} onChange={e => setConfigTarget(current => ({ ...current, temperature: Number(e.target.value) }))} />
+                  </div>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">Top-P</label><span className="badge-value">{configTarget?.top_p ?? 0.9}</span></div>
+                    <input className="control-slider" type="range" min="0.1" max="1" step="0.05" value={configTarget?.top_p ?? 0.9} onChange={e => setConfigTarget(current => ({ ...current, top_p: Number(e.target.value) }))} />
+                  </div>
+                </>
+              )}
+              {cfgModality === 'image' && (
+                <>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">Sampling steps</label><span className="badge-value">{configTarget?.steps ?? 25}</span></div>
+                    <input className="control-slider" type="range" min="1" max="50" step="1" value={configTarget?.steps ?? 25} onChange={e => setConfigTarget(current => ({ ...current, steps: Number(e.target.value) }))} />
+                    <div className="slider-hint">Default denoising steps for generation.</div>
+                  </div>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">CFG scale</label><span className="badge-value">{configTarget?.cfg_scale ?? 7}</span></div>
+                    <input className="control-slider" type="range" min="1" max="15" step="0.5" value={configTarget?.cfg_scale ?? 7} onChange={e => setConfigTarget(current => ({ ...current, cfg_scale: Number(e.target.value) }))} />
+                    <div className="slider-hint">How strongly the image follows the prompt.</div>
+                  </div>
+                  <div className="sidebar-section">
+                    <label className="section-label">Default size</label>
+                    <div className="mmproj-row">
+                      <input className="control-input" type="number" min="64" step="64" value={configTarget?.width ?? 512} onChange={e => setConfigTarget(current => ({ ...current, width: Number(e.target.value) }))} />
+                      <span style={{ color: 'var(--text-secondary)' }}>×</span>
+                      <input className="control-input" type="number" min="64" step="64" value={configTarget?.height ?? 512} onChange={e => setConfigTarget(current => ({ ...current, height: Number(e.target.value) }))} />
+                    </div>
+                  </div>
+                  <div className="sidebar-section">
+                    <label className="section-label">Seed</label>
+                    <input className="control-input" type="number" value={configTarget?.seed ?? -1} onChange={e => setConfigTarget(current => ({ ...current, seed: Number(e.target.value) }))} />
+                    <div className="slider-hint">-1 draws a random seed each generation.</div>
+                  </div>
+                </>
+              )}
+              {cfgModality === 'tts' && (
+                <div className="sidebar-section">
+                  <div className="slider-header"><label className="section-label">Speech speed</label><span className="badge-value">{(configTarget?.speed ?? 1).toFixed(2)}×</span></div>
+                  <input className="control-slider" type="range" min="0.5" max="2" step="0.05" value={configTarget?.speed ?? 1} onChange={e => setConfigTarget(current => ({ ...current, speed: Number(e.target.value) }))} />
+                  <div className="slider-hint">Playback rate for synthesized speech. Voice is chosen per request in the studio.</div>
+                </div>
+              )}
+              {cfgModality === 'mesh3d' && (
+                <>
+                  {configTarget?.mesh_input_kinds?.length ? (
+                    <div className="sidebar-section">
+                      <label className="section-label">Accepted inputs</label>
+                      <div className="slider-hint">{configTarget.mesh_input_kinds.map(k => k.replace('_', ' ')).join(', ')}</div>
+                    </div>
+                  ) : null}
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">Sampling steps</label><span className="badge-value">{configTarget?.steps ?? 64}</span></div>
+                    <input className="control-slider" type="range" min="1" max="64" step="1" value={configTarget?.steps ?? 64} onChange={e => setConfigTarget(current => ({ ...current, steps: Number(e.target.value) }))} />
+                  </div>
+                  <div className="sidebar-section">
+                    <div className="slider-header"><label className="section-label">Guidance scale</label><span className="badge-value">{configTarget?.guidance_scale ?? 15}</span></div>
+                    <input className="control-slider" type="range" min="0" max="30" step="0.5" value={configTarget?.guidance_scale ?? 15} onChange={e => setConfigTarget(current => ({ ...current, guidance_scale: Number(e.target.value) }))} />
+                  </div>
+                  <div className="sidebar-section">
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                      <input type="checkbox" checked={configTarget?.texture ?? true} onChange={e => setConfigTarget(current => ({ ...current, texture: e.target.checked }))} />
+                      <span className="section-label" style={{ margin: 0 }}>Generate texture</span>
+                    </label>
+                  </div>
+                  <div className="sidebar-section">
+                    <label className="section-label">Seed</label>
+                    <input className="control-input" type="number" value={configTarget?.seed ?? -1} onChange={e => setConfigTarget(current => ({ ...current, seed: Number(e.target.value) }))} />
+                    <div className="slider-hint">-1 draws a random seed each generation.</div>
+                  </div>
+                </>
+              )}
+              {cfgModality === 'audio' && (
+                <div className="sidebar-section">
+                  <div className="slider-hint">Speech-to-text model. Transcription options are chosen per request in the studio.</div>
+                </div>
+              )}
+              {cfgModality === 'video' && (
+                <div className="sidebar-section">
+                  <div className="slider-hint">Video model. Generation parameters are chosen per request in the studio.</div>
+                </div>
+              )}
               <div className="vram-preview-card">
                 <div className="preview-title"><Cpu size={13} /> Estimated VRAM</div>
                 <strong>{((modelFitPreview?.total_required_vram_bytes || 0) / 1e9).toFixed(2)} GB</strong>
               </div>
-              <button className="btn-load-model config-sidebar-load" onClick={() => handleLoadModel({ model_path: configTarget?.model_path, gpu_layers: configTarget?.gpu_layers ?? 99, context_size: configTarget?.context_size ?? 4096, mmproj_path: configTarget?.mmproj_path || undefined })} disabled={isLoadingModel}>
+              <button className="btn-load-model config-sidebar-load" onClick={async () => {
+                const cfg = configTarget;
+                const settings = {
+                  gpu_layers: cfg?.gpu_layers,
+                  context_size: cfg?.context_size,
+                  mmproj_path: cfg?.mmproj_path || undefined,
+                  temperature: cfg?.temperature,
+                  top_p: cfg?.top_p,
+                  steps: cfg?.steps,
+                  cfg_scale: cfg?.cfg_scale,
+                  width: cfg?.width,
+                  height: cfg?.height,
+                  seed: cfg?.seed,
+                  guidance_scale: cfg?.guidance_scale,
+                  texture: cfg?.texture,
+                  speed: cfg?.speed,
+                };
+                const card = modelCards.find(c => c.id === cfg?.cardId);
+                if (card) {
+                  await loadCardModel(card, settings);
+                } else {
+                  const modelId = await handleLoadModel({ model_path: cfg?.model_path, gpu_layers: cfg?.gpu_layers ?? 99, context_size: cfg?.context_size ?? 4096, mmproj_path: cfg?.mmproj_path || undefined });
+                  if (modelId) applyModelDefaults(cfg);
+                }
+              }} disabled={isLoadingModel}>
                 <Zap size={15} /> {isLoadingModel ? 'Loading...' : 'Load configured model'}
               </button>
               <div className="config-sidebar-section-title">Loaded models ({loadedModels.length})</div>

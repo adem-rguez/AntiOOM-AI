@@ -58,6 +58,9 @@ impl DaemonService for DaemonGrpcService {
             },
             tools: None,
             tool_choice: None,
+            image_params: None,
+            mesh_params: None,
+            audio_params: None,
         };
 
         let backend = backend_arc.read().await;
@@ -99,6 +102,7 @@ impl DaemonService for DaemonGrpcService {
         let load_opts = backend_trait::LoadOptions {
             gpu_layers: req.gpu_layers,
             context_size: req.context_size,
+            mmproj_path: req.mmproj_path.clone(),
             ..Default::default()
         };
 
