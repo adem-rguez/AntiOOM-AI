@@ -255,6 +255,19 @@ async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str) -> Tool
                     Ok(bytes) => Some(bytes),
                     Err(e) => return err(tool_call, e),
                 },
+                // The orchestrator often omits the 'image' argument even when the user just
+                // attached one (e.g. "make a 3d model out of this"). Mesh generation always
+                // needs an image, so fall back to the most recently attached one.
+                None if modality == "mesh3d" => {
+                    let fallback = state.last_image_handle.lock().await.clone();
+                    match fallback {
+                        Some(id) => match resolve_media_handle(state, &id).await {
+                            Ok(bytes) => Some(bytes),
+                            Err(_) => None,
+                        },
+                        None => None,
+                    }
+                }
                 None => None,
             };
             run_media_model(state, tool_call, modality, prompt, job_id, image).await

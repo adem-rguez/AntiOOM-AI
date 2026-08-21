@@ -6,7 +6,7 @@ import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
-import { Download, Layers } from 'lucide-react';
+import { Download, Layers, Move } from 'lucide-react';
 
 const MIME_BY_FORMAT = {
   glb: 'model/gltf-binary',
@@ -66,8 +66,16 @@ export default function Mesh3DViewer({ base64, url, format }) {
   const wireframeRef = useRef(wireframe);
   const loadedObjectRef = useRef(null);
   const [error, setError] = useState(null);
+  const [panning, setPanning] = useState(false);
+  const controlsRef = useRef(null);
 
   useEffect(() => { wireframeRef.current = wireframe; applyWireframe(loadedObjectRef.current, wireframe); }, [wireframe]);
+
+  useEffect(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    controls.mouseButtons.LEFT = panning ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+  }, [panning]);
 
   function applyWireframe(object, value) {
     if (!object) return;
@@ -84,7 +92,7 @@ export default function Mesh3DViewer({ base64, url, format }) {
     setError(null);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x07090e);
+    scene.background = new THREE.Color(0x1a1e2e);
 
     const camera = new THREE.PerspectiveCamera(45, container.clientWidth / Math.max(1, container.clientHeight), 0.01, 1000);
     camera.position.set(2, 2, 3);
@@ -92,22 +100,28 @@ export default function Mesh3DViewer({ base64, url, format }) {
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.3;
     container.appendChild(renderer.domElement);
 
-    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x1a1a2e, 1.1);
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444466, 1.5);
     scene.add(hemiLight);
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
     dirLight.position.set(3, 5, 4);
     scene.add(dirLight);
-    scene.add(new THREE.AmbientLight(0x404040, 0.6));
+    const fillLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    fillLight.position.set(-3, 2, -4);
+    scene.add(fillLight);
+    scene.add(new THREE.AmbientLight(0x606070, 0.8));
 
-    const grid = new THREE.GridHelper(10, 20, 0x2a3550, 0x1e293b);
+    const grid = new THREE.GridHelper(10, 20, 0x3a4560, 0x2e394b);
     grid.position.y = -0.001;
     scene.add(grid);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
+    controlsRef.current = controls;
 
     let animationFrameId = null;
     let disposed = false;
@@ -216,6 +230,7 @@ export default function Mesh3DViewer({ base64, url, format }) {
       renderer.dispose();
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
       loadedObjectRef.current = null;
+      controlsRef.current = null;
     };
   }, [base64, url, format]);
 
@@ -247,6 +262,14 @@ export default function Mesh3DViewer({ base64, url, format }) {
           title="Toggle wireframe"
         >
           <Layers size={14} /> Wireframe
+        </button>
+        <button
+          type="button"
+          className={`mesh3d-tool-btn ${panning ? 'active' : ''}`}
+          onClick={() => setPanning(p => !p)}
+          title="Toggle pan mode"
+        >
+          <Move size={14} /> Pan
         </button>
         <button type="button" className="mesh3d-tool-btn" onClick={handleDownload} title="Download mesh">
           <Download size={14} /> Download

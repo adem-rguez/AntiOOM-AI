@@ -4,11 +4,12 @@ import {
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
   CheckCircle2, XCircle, PackagePlus, Box, Boxes, Paperclip, X, Pencil,
-  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight
+  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Mesh3DViewer, { isMeshResource, guessMeshFormat } from './Mesh3DViewer';
+import { ErrorLogProvider, ErrorToasts, useErrorLog } from './ErrorLog';
 import './App.css';
 
 function findResponseStart(text) {
@@ -270,7 +271,8 @@ const formatParamStop = (billions) => {
   return `${billions % 1 === 0 ? billions : billions.toFixed(1)}B`;
 };
 
-export default function App() {
+function AppInner() {
+  const { pushError } = useErrorLog();
   const [activeTab, setActiveTab] = useState('models');
   const [modelPath, setModelPath] = useState(
     'models\\Qwen3.5-0.8B-Q8_0.gguf'
@@ -533,6 +535,9 @@ export default function App() {
   const [hfDownloads, setHfDownloads] = useState({});
   const [showDownloadsPanel, setShowDownloadsPanel] = useState(false);
   const [pendingCatalogJump, setPendingCatalogJump] = useState(null);
+  const [hfTokenInput, setHfTokenInput] = useState('');
+  const [hfTokenSaved, setHfTokenSaved] = useState(false);
+  const [hfHasToken, setHfHasToken] = useState(false);
 
   const closeModelPicker = () => {
     setShowModelPicker(false);
@@ -619,6 +624,29 @@ export default function App() {
     return () => clearTimeout(handle);
   }, [hfSearchQuery, hfSort, hfFilters, hfParamMinIdx, hfParamMaxIdx, modelPickerTab, runHfSearch]);
 
+  useEffect(() => {
+    fetch('http://127.0.0.1:8080/v1/model/hf-token')
+      .then(res => res.json())
+      .then(data => setHfHasToken(data.has_token))
+      .catch(() => {});
+  }, []);
+
+  const saveHfToken = () => {
+    fetch('http://127.0.0.1:8080/v1/model/hf-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: hfTokenInput }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        setHfHasToken(data.has_token);
+        setHfTokenSaved(true);
+        setHfTokenInput('');
+        setTimeout(() => setHfTokenSaved(false), 3000);
+      })
+      .catch(() => {});
+  };
+
   const selectHfRepo = (repoId) => {
     if (hfSelectedRepo === repoId) {
       setHfSelectedRepo(null);
@@ -633,6 +661,13 @@ export default function App() {
     setHfRepoKind(null);
     setHfAutodownload([]);
     setHfAutodownloadReason(null);
+    setHfDownloads(current => {
+      const next = { ...current };
+      for (const key of Object.keys(next)) {
+        if (next[key].status === 'complete') delete next[key];
+      }
+      return next;
+    });
     setHfRepoFilesLoading(true);
     fetch(`http://127.0.0.1:8080/v1/model/hf-files?repo=${encodeURIComponent(repoId)}`)
       .then(res => res.ok ? res.json() : null)
@@ -829,6 +864,8 @@ export default function App() {
       texture: s.texture,
       speed: s.speed,
       mmproj_path: s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || '',
+      mesh_vae_path: s.mesh_vae_path || card.mesh_vae_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_vae_path || '',
+      mesh_texgen_path: s.mesh_texgen_path || card.mesh_texgen_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_texgen_path || '',
     });
   };
 
@@ -868,11 +905,11 @@ export default function App() {
         setTimeout(fetchSystemInfo, 1500);
         return data.model_id;
       } else {
-        alert('Failed to load model: ' + (data?.error || res.statusText));
+        pushError('Failed to load model: ' + (data?.error || res.statusText));
         return null;
       }
     } catch (err) {
-      alert('Error loading model: ' + err.message);
+      pushError('Error loading model: ' + err.message);
       return null;
     } finally {
       setIsLoadingModel(false);
@@ -954,9 +991,45 @@ export default function App() {
         setTimeout(fetchSystemInfo, 1500);
       }
     } catch (err) {
-      alert('Error ejecting model: ' + err.message);
+      pushError('Error ejecting model: ' + err.message);
     } finally {
       setUnloadingModelId(null);
+    }
+  };
+
+  const handleOpenModelFolder = async (modelPath) => {
+    try {
+      const res = await fetch('http://127.0.0.1:8080/v1/model/open-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: modelPath }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        pushError('Failed to open folder: ' + (data?.error || res.statusText));
+      }
+    } catch (err) {
+      pushError('Error opening folder: ' + err.message);
+    }
+  };
+
+  const handleDeleteCatalogModel = async (model) => {
+    if (!window.confirm(`Delete "${model.name}" permanently?`)) return;
+    try {
+      const res = await fetch('http://127.0.0.1:8080/v1/model/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: model.path, mmproj_path: model.mmproj_path || undefined }),
+      });
+      if (res.ok) {
+        fetchCatalog();
+        setModelCards(current => current.filter(card => card.modelPath !== model.path));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        pushError('Failed to delete model: ' + (data?.error || res.statusText));
+      }
+    } catch (err) {
+      pushError('Error deleting model: ' + err.message);
     }
   };
 
@@ -1037,20 +1110,23 @@ export default function App() {
 
 
   useEffect(() => {
+    if (!configTarget) return;
+    const card = modelCards.find(c => c.id === configTarget.cardId);
+    const sizeBytes = card?.size_bytes || 0;
+    if (!sizeBytes) { setModelFitPreview(null); return; }
     fetch('http://127.0.0.1:8080/v1/fit-estimator', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        parameter_count_billions: 0.8,
-        quantization: 'Q8_0',
-        context_size: parseInt(contextSize, 10),
-        modality: 'Text',
+        model_size_bytes: sizeBytes,
+        context_size: configTarget.context_size ?? 4096,
+        modality: configTarget.modality || 'text',
       }),
     })
       .then(res => res.json())
       .then(data => setModelFitPreview(data))
       .catch(() => {});
-  }, [contextSize, configTarget?.model_path]);
+  }, [configTarget?.cardId, configTarget?.context_size, configTarget?.modality, modelCards]);
 
   const messagesEndRef = useRef(null);
 
@@ -1092,10 +1168,14 @@ export default function App() {
 
   // Shared fetch+SSE-parsing core, reused by both a fresh user send and a
   // resumed request after the user picks a model from a model_choice prompt.
-  const streamAssistantResponse = async (requestBody, aiId, titleText) => {
-    // Accumulators for the two phases
-    let thinkingBuf = '';
-    let answerBuf = '';
+  const streamAssistantResponse = async (requestBody, aiId, titleText, priorContent = '') => {
+    // Accumulators for the two phases. When resuming into an existing
+    // assistant message (e.g. after a model_choice pick), seed these from
+    // that message's current content so the earlier reasoning/tool call
+    // aren't wiped out by the first updateMsg() of this new hop.
+    const seeded = parseThinking(priorContent);
+    let thinkingBuf = seeded.thinking;
+    let answerBuf = seeded.answer;
     let inThinkingPhase = true; // reasoning_content comes before content
     let tokenCount = 0;
     let finishReason = null;
@@ -1317,10 +1397,11 @@ export default function App() {
 
     // Continue streaming the chosen model's result INTO the same assistant
     // message so the earlier reasoning and tool call stay visible.
+    const priorContent = messages.find(m => m.id === aiId)?.content || '';
     syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: true } : m));
     setIsGenerating(true);
 
-    await streamAssistantResponse({ ...requestBody, forced_model: option.model }, aiId, null);
+    await streamAssistantResponse({ ...requestBody, forced_model: option.model }, aiId, null, priorContent);
   };
 
   const addAttachments = async (files) => {
@@ -1389,7 +1470,7 @@ export default function App() {
         setImgSrc('data:image/png;base64,' + data.data[0].b64_json);
       }
     } catch (e) {
-      alert('Image generation error: ' + e);
+      pushError('Image generation error: ' + e);
     } finally {
       setIsGeneratingImg(false);
     }
@@ -1455,7 +1536,7 @@ export default function App() {
         setMesh3dResult({ base64: data.mesh_base64, format: data.format || mesh3dFormat });
       }
     } catch (e) {
-      alert('3D mesh generation error: ' + e);
+      pushError('3D mesh generation error: ' + e);
     } finally {
       setIsGeneratingMesh(false);
     }
@@ -1471,7 +1552,7 @@ export default function App() {
         setAudioSrc('data:audio/wav;base64,' + data.audio_b64);
       }
     } catch (e) {
-      alert('TTS error: ' + e);
+      pushError('TTS error: ' + e);
     } finally {
       setIsGeneratingTts(false);
     }
@@ -1577,7 +1658,22 @@ export default function App() {
                         )
                       )}
                       {download.status === 'error' && (
-                        <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Failed{download.error ? `: ${download.error}` : ''}</span>
+                        <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>
+                          Failed{download.error ? `: ${download.error}` : ''}
+                          {download.error && (download.error.includes('403') || download.error.toLowerCase().includes('forbidden')) && (
+                            <span style={{ display: 'block', marginTop: 2, fontSize: 11 }}>
+                              License acceptance required —{' '}
+                              <a href={`https://huggingface.co/${download.repo}`} target="_blank" rel="noreferrer" style={{ color: '#60a5fa', textDecoration: 'underline' }}>open model page</a>
+                              {' '}to accept terms, then retry.
+                            </span>
+                          )}
+                          {download.error && (download.error.includes('401') || download.error.toLowerCase().includes('unauthorized')) && (
+                            <span style={{ display: 'block', marginTop: 2, fontSize: 11 }}>
+                              Authentication required — add your HF token in{' '}
+                              <a href="#" onClick={e => { e.preventDefault(); setActiveTab('settings'); }} style={{ color: '#60a5fa', textDecoration: 'underline' }}>General Settings</a>
+                            </span>
+                          )}
+                        </span>
                       )}
                       {download.status === 'complete' && (
                         <span className="modal-list-item-meta" style={{ color: 'var(--accent-green)' }}>Complete</span>
@@ -2069,14 +2165,13 @@ export default function App() {
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Load multiple local GGUF models and choose which one powers the chat.
               </p>
-              <div className="grid-2">
-                <div className="card">
-                  <h3 style={{ marginBottom: '1rem' }}>My Models</h3>
+              <div className="card" style={{ background: 'none', border: 'none', padding: 0 }}>
+                  <div className="model-cards-grid">
                   {modelCards.map(card => {
                     const loadedEntry = loadedModels.find(loaded => loaded.model_id === card.loadedModelId);
                     const isLoaded = Boolean(loadedEntry);
                     return (
-                      <div key={card.id} style={{ borderBottom: '1px solid var(--border-color)', padding: '0.85rem 0' }}>
+                      <div key={card.id} className="model-card-item">
                         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
                           <strong>{card.name}</strong>
                           <button
@@ -2101,12 +2196,13 @@ export default function App() {
                           }} disabled={unloadingModelId === card.loadedModelId}><Power size={14} /> Eject</button>
                           : <button className="btn-load-model" onClick={() => loadCardModel(card)} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
                           {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, card)} title="Start studio"><Play size={14} /></button>}
+                          <button className="btn-load-model" onClick={() => handleOpenModelFolder(card.modelPath)} title="Open containing folder"><Folder size={14} /> Open Folder</button>
                         </div>
                       </div>
                     );
                   })}
+                  </div>
                   {modelCards.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No model cards yet. Click "Add Model" to add one from the catalog.</p>}
-                </div>
               </div>
             </div>
           )}
@@ -2143,30 +2239,38 @@ export default function App() {
                         {detectedModels
                           .filter(model => model.name.toLowerCase().includes(modelPickerSearch.toLowerCase()))
                           .map(model => (
-                            <button
-                              key={model.path}
-                              className="modal-list-item"
-                              onClick={() => {
-                                setModelCards(current => [...current, {
-                                  id: crypto.randomUUID(),
-                                  modelPath: model.path,
-                                  name: model.name,
-                                  modality: model.modality,
-                                  size_bytes: model.size_bytes,
-                                  max_context_size: model.max_context_size ?? null,
-                                  image_input_available: model.image_input_available === true,
-                                  mmproj_path: model.mmproj_path || null,
-                                  settings: {},
-                                }]);
-                                closeModelPicker();
-                              }}
-                            >
-                              <strong>{model.name}</strong>
-                              <span className="modal-list-item-meta">
-                                {model.modality?.toUpperCase()}
-                                <span className="hf-param-badge">{(model.size_bytes / 1e9).toFixed(2)} GB</span>
-                              </span>
-                            </button>
+                            <div key={model.path} className="modal-list-item" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
+                              <button
+                                className="modal-list-item-main"
+                                style={{ flex: 1, textAlign: 'left', background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'inherit' }}
+                                onClick={() => {
+                                  setModelCards(current => [...current, {
+                                    id: crypto.randomUUID(),
+                                    modelPath: model.path,
+                                    name: model.name,
+                                    modality: model.modality,
+                                    size_bytes: model.size_bytes,
+                                    max_context_size: model.max_context_size ?? null,
+                                    image_input_available: model.image_input_available === true,
+                                    mmproj_path: model.mmproj_path || null,
+                                    mesh_vae_path: model.mesh_vae_path || null,
+                                    mesh_texgen_path: model.mesh_texgen_path || null,
+                                    settings: {},
+                                  }]);
+                                  closeModelPicker();
+                                }}
+                              >
+                                <strong>{model.name}</strong>
+                                <span className="modal-list-item-meta">
+                                  {model.modality?.toUpperCase()}
+                                  <span className="hf-param-badge">{(model.size_bytes / 1e9).toFixed(2)} GB</span>
+                                </span>
+                              </button>
+                              <div style={{ display: 'flex', gap: '0.35rem', flexShrink: 0 }}>
+                                <button className="btn-load-model" onClick={() => handleOpenModelFolder(model.path)} title="Open containing folder"><Folder size={14} /></button>
+                                <button className="btn-remove-card" onClick={() => handleDeleteCatalogModel(model)} title="Delete model from disk"><Trash2 size={13} /></button>
+                              </div>
+                            </div>
                           ))}
                         {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in AIATM's models folder.</p>}
                       </div>
@@ -2509,7 +2613,22 @@ export default function App() {
                                                       </>
                                                     )}
                                                     {download && download.status === 'error' && (
-                                                      <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>Download failed{download.error ? `: ${download.error}` : ''}</span>
+                                                      <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>
+                                                        Download failed{download.error ? `: ${download.error}` : ''}
+                                                        {download.error && (download.error.includes('403') || download.error.toLowerCase().includes('forbidden')) && (
+                                                          <span style={{ display: 'block', marginTop: 2, fontSize: 11 }}>
+                                                            This model requires license acceptance —{' '}
+                                                            <a href={`https://huggingface.co/${hfSelectedRepo}`} target="_blank" rel="noreferrer" style={{ color: '#60a5fa', textDecoration: 'underline' }}>open model page</a>
+                                                            {' '}to accept the terms, then retry.
+                                                          </span>
+                                                        )}
+                                                        {download.error && (download.error.includes('401') || download.error.toLowerCase().includes('unauthorized')) && (
+                                                          <span style={{ display: 'block', marginTop: 2, fontSize: 11 }}>
+                                                            Authentication required — add your HF token in{' '}
+                                                            <a href="#" onClick={e => { e.preventDefault(); setActiveTab('settings'); }} style={{ color: '#60a5fa', textDecoration: 'underline' }}>General Settings</a>
+                                                          </span>
+                                                        )}
+                                                      </span>
                                                     )}
                                                   </div>
                                                   <div className="hf-file-actions">
@@ -2592,6 +2711,24 @@ export default function App() {
                     <option value="86400:false">24 hours</option>
                     <option value="0:true">Forever (save to disk)</option>
                   </select>
+                </div>
+                <div style={{ padding: '1rem 0', borderTop: '1px solid var(--border-color)' }}>
+                  <div className="slider-header"><div><strong>HuggingFace token</strong><div className="slider-hint">Required for downloading gated models. Get yours at huggingface.co/settings/tokens</div></div>{hfHasToken && <span style={{ color: 'var(--accent-green)', fontSize: '0.8rem', fontWeight: 600 }}>Active</span>}</div>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                    <input
+                      type="password"
+                      className="control-input"
+                      placeholder="hf_..."
+                      value={hfTokenInput}
+                      onChange={e => setHfTokenInput(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && saveHfToken()}
+                      style={{ flex: 1 }}
+                    />
+                    <button className="btn-primary" onClick={saveHfToken} disabled={!hfTokenInput.trim()} style={{ padding: '0.4rem 1rem' }}>
+                      Save
+                    </button>
+                  </div>
+                  {hfTokenSaved && <div style={{ color: 'var(--accent-green)', fontSize: '0.8rem', marginTop: 4 }}>Token saved!</div>}
                 </div>
               </div>
             </div>
@@ -3026,6 +3163,16 @@ export default function App() {
               )}
               {cfgModality === 'mesh3d' && (
                 <>
+                  <div className="sidebar-section">
+                    <label className="section-label">VAE model</label>
+                    <input className="control-input" value={configTarget?.mesh_vae_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mesh_vae_path: e.target.value }))} />
+                    <div className="slider-hint">Auto-detected from model directory. Override to use a different VAE.</div>
+                  </div>
+                  <div className="sidebar-section">
+                    <label className="section-label">Texture / paint model</label>
+                    <input className="control-input" value={configTarget?.mesh_texgen_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mesh_texgen_path: e.target.value }))} />
+                    <div className="slider-hint">Auto-detected from model directory. Override to use a different texture model.</div>
+                  </div>
                   {configTarget?.mesh_input_kinds?.length ? (
                     <div className="sidebar-section">
                       <label className="section-label">Accepted inputs</label>
@@ -3115,6 +3262,15 @@ export default function App() {
           </aside>
         </>
       )}
+      <ErrorToasts />
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorLogProvider>
+      <AppInner />
+    </ErrorLogProvider>
   );
 }

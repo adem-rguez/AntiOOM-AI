@@ -1,9 +1,12 @@
+mod component_specs;
+
 use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use backend_trait::{
     BackendError, GenerationProgress, ImageParams, InferenceBackend, InferenceChunk, InferenceRequest,
     InferenceResponse, InferenceStream, LoadOptions, Modality, VramEstimate,
 };
+use component_specs::{match_component_spec, ComponentKind, ComponentSpec};
 use futures::stream;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -12,6 +15,29 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use base64::Engine;
+
+/// The specific stderr substring `sd.exe` emits when a `.gguf` file is a
+/// standalone diffusion-transformer (no VAE/text-encoder) and can't be
+/// loaded via the legacy full-checkpoint `-m` flag. Its presence is the
+/// trigger to retry generation in split-checkpoint "component mode".
+const SD_VERSION_SNIFF_FAILURE: &str = "get sd version from file failed";
+
+/// Resolved arguments for one `sd.exe` invocation: either the legacy
+/// single-file checkpoint path, or a split-checkpoint "component mode"
+/// invocation built from a matched `ComponentSpec`.
+enum SdCommandMode {
+    Legacy(PathBuf),
+    Component {
+        diffusion_model: PathBuf,
+        clip_l: Option<PathBuf>,
+        clip_g: Option<PathBuf>,
+        t5xxl: Option<PathBuf>,
+        llm: Option<PathBuf>,
+        vae: PathBuf,
+        vae_format: Option<&'static str>,
+        model_args: Option<&'static str>,
+    },
+}
 
 /// Live progress reported by the `sd.exe` (GGUF) generation path, parsed
 /// from the child process's stderr.
@@ -212,26 +238,217 @@ impl SdBackend {
         found
     }
 
-    /// Run `sd.exe` against a temp output PNG, tracking live progress via
-    /// `gguf_progress`, and return the resulting PNG bytes.
-    async fn generate_gguf(
-        sd_binary: &Path,
+    /// Locate AIATM's `models` directory the same way `daemon-core` does
+    /// (`AIATM_MODELS_DIR` override, then walking up from the current/exe
+    /// directory, then the workspace source tree for dev builds).
+    fn resolve_models_root() -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Ok(directory) = std::env::var("AIATM_MODELS_DIR") {
+            candidates.push(PathBuf::from(directory));
+        }
+        if let Ok(current_dir) = std::env::current_dir() {
+            candidates.extend(current_dir.ancestors().map(|path| path.join("models")));
+        }
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                candidates.extend(parent.ancestors().map(|path| path.join("models")));
+            }
+        }
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../models"));
+
+        candidates.into_iter().find(|directory| directory.is_dir())
+    }
+
+    /// Search a single directory (non-recursively) for a file whose name
+    /// contains one of `patterns` (case-insensitive).
+    fn find_component_in_dir(dir: &Path, patterns: &[&str]) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+            if patterns.iter().any(|p| name.contains(&p.to_ascii_lowercase())) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Search a directory tree (recursively) for a file whose name contains
+    /// one of `patterns` (case-insensitive).
+    fn find_component_recursive(dir: &Path, patterns: &[&str]) -> Option<PathBuf> {
+        if let Some(found) = Self::find_component_in_dir(dir, patterns) {
+            return Some(found);
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = Self::find_component_recursive(&path, patterns) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve one required component: first next to the diffusion model
+    /// (tier 1), then in the shared components directory (tier 2).
+    fn resolve_component(
+        kind: &ComponentKind,
+        diffusion_dir: &Path,
+        models_root: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let patterns = kind.filename_patterns();
+        if let Some(found) = Self::find_component_in_dir(diffusion_dir, &patterns) {
+            return Some(found);
+        }
+        let models_root = models_root?;
+        let shared_dir = models_root.join(kind.shared_subdir().replace('/', std::path::MAIN_SEPARATOR_STR));
+        Self::find_component_recursive(&shared_dir, &patterns)
+    }
+
+    /// Build a `SdCommandMode::Component` for `model_path` by matching its
+    /// filename against the architecture family table and resolving every
+    /// required component. Returns the spec's `default_cfg_scale`/
+    /// `default_steps` alongside the mode for `generate_gguf` to apply.
+    fn resolve_component_mode(
         model_path: &Path,
+    ) -> Result<(SdCommandMode, Option<f32>, Option<u32>), BackendError> {
+        let filename = model_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+
+        let spec: &'static ComponentSpec = match_component_spec(filename).ok_or_else(|| {
+            BackendError::InferenceError(format!(
+                "'{}' is a standalone diffusion-model file, but its architecture family \
+                 isn't recognized for split-checkpoint (component-mode) loading. Add a \
+                 matching pattern to sd-backend's component_specs table.",
+                filename
+            ))
+        })?;
+
+        let diffusion_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
+        let models_root = Self::resolve_models_root();
+
+        let mut clip_l = None;
+        let mut clip_g = None;
+        let mut t5xxl = None;
+        let mut llm = None;
+        let mut vae = None;
+
+        for kind in spec.components {
+            let resolved = Self::resolve_component(kind, diffusion_dir, models_root.as_deref());
+            match resolved {
+                Some(path) => match kind {
+                    ComponentKind::ClipL => clip_l = Some(path),
+                    ComponentKind::ClipG => clip_g = Some(path),
+                    ComponentKind::T5xxl => t5xxl = Some(path),
+                    ComponentKind::Llm(_) => llm = Some(path),
+                    ComponentKind::Vae => vae = Some(path),
+                },
+                None => {
+                    let shared_dir = models_root
+                        .as_ref()
+                        .map(|root| root.join(kind.shared_subdir().replace('/', std::path::MAIN_SEPARATOR_STR)))
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| format!("models/{}", kind.shared_subdir()));
+                    return Err(BackendError::InferenceError(format!(
+                        "'{}' ({} family) needs a {} component, but none was found next to the \
+                         diffusion model or in the shared components folder. Place it at: {}",
+                        filename, spec.family, kind.display_name(), shared_dir
+                    )));
+                }
+            }
+        }
+
+        let vae = vae.ok_or_else(|| {
+            BackendError::InferenceError(format!(
+                "'{}' ({} family) requires a VAE component, but none was resolved.",
+                filename, spec.family
+            ))
+        })?;
+
+        Ok((
+            SdCommandMode::Component {
+                diffusion_model: model_path.to_path_buf(),
+                clip_l,
+                clip_g,
+                t5xxl,
+                llm,
+                vae,
+                vae_format: spec.vae_format,
+                model_args: spec.model_args,
+            },
+            spec.default_cfg_scale,
+            spec.default_steps,
+        ))
+    }
+
+    /// Run `sd.exe` once with the given command mode, tracking live progress
+    /// via `gguf_progress`, and return the resulting PNG bytes (or the raw
+    /// error, uninspected, for the caller to decide whether to retry).
+    async fn run_sd_exe(
+        sd_binary: &Path,
+        mode: &SdCommandMode,
         request_id: &str,
         prompt: &str,
         params: &ImageParams,
+        cfg_scale_override: Option<f32>,
+        steps_override: Option<u32>,
         gguf_progress: &Arc<Mutex<GgufProgress>>,
     ) -> Result<Vec<u8>, BackendError> {
         let out_path = std::env::temp_dir().join(format!("aiatm_sd_{}.png", request_id));
-        let total_steps = params.steps.unwrap_or(20);
+        let total_steps = params.steps.or(steps_override).unwrap_or(20);
+        let cfg_scale = params.cfg_scale.or(cfg_scale_override).unwrap_or(7.0);
 
         let mut cmd = tokio::process::Command::new(sd_binary);
-        cmd.arg("-m").arg(model_path).arg("-p").arg(prompt);
+        match mode {
+            SdCommandMode::Legacy(model_path) => {
+                cmd.arg("-m").arg(model_path);
+            }
+            SdCommandMode::Component {
+                diffusion_model,
+                clip_l,
+                clip_g,
+                t5xxl,
+                llm,
+                vae,
+                vae_format,
+                model_args,
+            } => {
+                cmd.arg("--diffusion-model").arg(diffusion_model);
+                if let Some(p) = clip_l {
+                    cmd.arg("--clip_l").arg(p);
+                }
+                if let Some(p) = clip_g {
+                    cmd.arg("--clip_g").arg(p);
+                }
+                if let Some(p) = t5xxl {
+                    cmd.arg("--t5xxl").arg(p);
+                }
+                if let Some(p) = llm {
+                    cmd.arg("--llm").arg(p);
+                }
+                cmd.arg("--vae").arg(vae);
+                if let Some(format) = vae_format {
+                    cmd.arg("--vae-format").arg(format);
+                }
+                if let Some(args) = model_args {
+                    cmd.arg("--model-args").arg(args);
+                }
+            }
+        }
+        cmd.arg("-p").arg(prompt);
         if let Some(negative) = &params.negative_prompt {
             cmd.arg("-n").arg(negative);
         }
         cmd.arg("--steps").arg(total_steps.to_string());
-        cmd.arg("--cfg-scale").arg(params.cfg_scale.unwrap_or(7.0).to_string());
+        cmd.arg("--cfg-scale").arg(cfg_scale.to_string());
         cmd.arg("-W").arg(params.width.unwrap_or(512).to_string());
         cmd.arg("-H").arg(params.height.unwrap_or(512).to_string());
         if let Some(seed) = params.seed {
@@ -332,6 +549,45 @@ impl SdBackend {
         })?;
         let _ = tokio::fs::remove_file(&out_path).await;
         Ok(bytes)
+    }
+
+    /// Generate an image via `sd.exe`. Tries the legacy full-checkpoint `-m`
+    /// path first; if that fails with sd.exe's specific "can't sniff
+    /// architecture from this file" error, retries once in split-checkpoint
+    /// "component mode" (resolved from `component_specs`). Any other failure
+    /// is surfaced immediately, unretried.
+    async fn generate_gguf(
+        sd_binary: &Path,
+        model_path: &Path,
+        request_id: &str,
+        prompt: &str,
+        params: &ImageParams,
+        gguf_progress: &Arc<Mutex<GgufProgress>>,
+    ) -> Result<Vec<u8>, BackendError> {
+        let legacy_mode = SdCommandMode::Legacy(model_path.to_path_buf());
+        match Self::run_sd_exe(sd_binary, &legacy_mode, request_id, prompt, params, None, None, gguf_progress).await {
+            Ok(bytes) => Ok(bytes),
+            Err(BackendError::InferenceError(msg)) if msg.contains(SD_VERSION_SNIFF_FAILURE) => {
+                info!(
+                    "'{}' looks like a standalone diffusion-model file (sd.exe couldn't sniff a \
+                     full checkpoint architecture from it); retrying in component mode.",
+                    model_path.display()
+                );
+                let (component_mode, default_cfg_scale, default_steps) = Self::resolve_component_mode(model_path)?;
+                Self::run_sd_exe(
+                    sd_binary,
+                    &component_mode,
+                    request_id,
+                    prompt,
+                    params,
+                    default_cfg_scale,
+                    default_steps,
+                    gguf_progress,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// POST the prompt+params to the running `diffusers_server.py` instance

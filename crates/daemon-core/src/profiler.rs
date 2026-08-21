@@ -13,10 +13,14 @@ pub struct SystemHardwareInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FitEstimationRequest {
+    #[serde(default)]
     pub parameter_count_billions: f64,
+    #[serde(default)]
     pub quantization: String, // e.g. "Q4_K_M", "Q8_0", "F16"
     pub context_size: u32,
     pub modality: String,
+    #[serde(default)]
+    pub model_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +100,11 @@ impl HardwareProfiler {
             _ => 4.5,
         };
 
-        let weight_bytes = (req.parameter_count_billions * 1e9 * (bits_per_weight / 8.0)) as u64;
+        let weight_bytes = if let Some(size) = req.model_size_bytes {
+            size
+        } else {
+            (req.parameter_count_billions * 1e9 * (bits_per_weight / 8.0)) as u64
+        };
         
         // KV cache size calculation: 2 * layers * heads * dim * context_size * bytes_per_element
         let kv_cache_bytes = ((req.context_size as f64) * 512.0 * 1024.0) as u64;

@@ -80,6 +80,12 @@ pub struct AppState {
     /// Model paths the user has added to the Model Studio in the frontend.
     /// `list_models` filters the catalog down to only these when non-empty.
     pub studio_models: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Runtime-configurable Hugging Face auth token (overrides HF_TOKEN env var / cached token file).
+    pub hf_token: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Media handle of the most recently attached user image, so `run_model` can fall back to
+    /// it when the orchestrator calls an image-consuming tool (e.g. 3D mesh) without an
+    /// explicit `image` argument.
+    pub last_image_handle: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,9 +106,9 @@ pub struct ChatCompletionMessage {
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
-/// Decode and return image bytes from any `image_url` data URL found in the
-/// OpenAI-style chat-completion payload's messages. Returns the first image.
-fn extract_image_input(messages: &[ChatCompletionMessage]) -> Option<Vec<u8>> {
+/// Decode and return image bytes and mime type from any `image_url` data URL found in
+/// the OpenAI-style chat-completion payload's messages. Returns the first image.
+fn extract_image_input(messages: &[ChatCompletionMessage]) -> Option<(Vec<u8>, String)> {
     use base64::Engine;
     for msg in messages {
         if let serde_json::Value::Array(parts) = &msg.content {
@@ -113,9 +119,10 @@ fn extract_image_input(messages: &[ChatCompletionMessage]) -> Option<Vec<u8>> {
                 if let Some(url) = url {
                     if let Some(rest) = url.strip_prefix("data:") {
                         if let Some(comma_idx) = rest.find(',') {
+                            let mime = rest[..comma_idx].split(';').next().unwrap_or("image/png").to_string();
                             let b64 = &rest[comma_idx + 1..];
                             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                return Some(bytes);
+                                return Some((bytes, mime));
                             }
                         }
                     }
@@ -124,6 +131,18 @@ fn extract_image_input(messages: &[ChatCompletionMessage]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Give the orchestrator a note (appended to the system prompt) pointing it at the
+/// media handle for an image the user just attached, so a follow-up `run_model` call
+/// (e.g. image -> 3D mesh) can reference it via the `image` argument.
+fn image_handle_note(media_id: &str) -> String {
+    format!(
+        "\n\nThe user's latest message has an attached image, stored as media handle '{}'. \
+         If you call run_model with a tool that consumes an image (e.g. image-to-3D, image-to-image), \
+         pass '{}' as the 'image' argument.",
+        media_id, media_id
+    )
 }
 
 
@@ -263,8 +282,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/model/hf-search", get(hf_search))
         .route("/v1/model/hf-files", get(hf_files))
         .route("/v1/model/hf-download", post(hf_download))
+        .route("/v1/model/hf-token", post(hf_set_token).get(hf_get_token_status))
         .route("/v1/model/hf-download/status", get(hf_download_status))
         .route("/v1/model/hf-download/cancel", post(hf_download_cancel))
+        .route("/v1/model/open-folder", post(open_model_folder))
+        .route("/v1/model/delete", post(delete_model))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/:id/progress", get(get_job_progress))
         .with_state(state)
@@ -1255,9 +1277,17 @@ async fn stream_chat_completions(
     // Build messages with system prompt. If any message carries an image_url,
     // forward the multimodal content array unchanged to llama-server (which
     // needs --mmproj loaded to actually accept the image part).
-    let has_image = extract_image_input(&payload.inner.messages).is_some();
+    let image_input = extract_image_input(&payload.inner.messages);
+    let has_image = image_input.is_some();
     let last_user_idx = if has_image {
         payload.inner.messages.iter().rposition(|m| m.role == "user")
+    } else {
+        None
+    };
+    let image_media_id = if let Some((bytes, mime)) = image_input {
+        let id = state.media_store.store(bytes, &mime).await;
+        *state.last_image_handle.lock().await = Some(id.clone());
+        Some(id)
     } else {
         None
     };
@@ -1278,6 +1308,10 @@ async fn stream_chat_completions(
         )
     } else {
         "You are a helpful, knowledgeable AI assistant.".to_string()
+    };
+    let system_content = match &image_media_id {
+        Some(id) => format!("{}{}", system_content, image_handle_note(id)),
+        None => system_content,
     };
 
     let mut chat_messages: Vec<serde_json::Value> = vec![
@@ -1685,9 +1719,17 @@ async fn chat_completions(
     }
 
     // Build messages
-    let has_image = extract_image_input(&payload.messages).is_some();
+    let image_input = extract_image_input(&payload.messages);
+    let has_image = image_input.is_some();
     let last_user_idx = if has_image {
         payload.messages.iter().rposition(|m| m.role == "user")
+    } else {
+        None
+    };
+    let image_media_id = if let Some((bytes, mime)) = image_input {
+        let id = state.media_store.store(bytes, &mime).await;
+        *state.last_image_handle.lock().await = Some(id.clone());
+        Some(id)
     } else {
         None
     };
@@ -1709,6 +1751,10 @@ async fn chat_completions(
         )
     } else {
         "You are a helpful, knowledgeable AI assistant.".to_string()
+    };
+    let system_content = match &image_media_id {
+        Some(id) => format!("{}{}", system_content, image_handle_note(id)),
+        None => system_content,
     };
 
     let mut chat_messages: Vec<serde_json::Value> = vec![
@@ -2486,6 +2532,11 @@ pub struct DetectedModelEntry {
     /// For `modality == "mesh3d"`, which input kinds this model accepts
     /// (subset of "text", "image", "multi_image"). `None` for other modalities.
     pub mesh_input_kinds: Option<Vec<String>>,
+    /// For mesh3d models with multi-component repos (e.g. Hunyuan3D):
+    /// path to the VAE component subfolder.
+    pub mesh_vae_path: Option<String>,
+    /// Path to the texture/paint component subfolder.
+    pub mesh_texgen_path: Option<String>,
 }
 
 fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -2502,6 +2553,27 @@ fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
 
 fn has_image_projector(path: &std::path::Path) -> bool {
     find_sibling_mmproj(path).is_some()
+}
+
+/// For multi-component mesh3d repos (e.g. Hunyuan3D-2.x), detect sibling
+/// subfolders that contain the VAE and paint/texture pipeline components.
+fn find_mesh3d_siblings(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    // path is the repo root directory for mesh3d models
+    let dir = if path.is_dir() { path } else { return (None, None); };
+    let mut vae_path = None;
+    let mut texgen_path = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !entry.path().is_dir() { continue; }
+            if name.contains("vae") {
+                vae_path = Some(entry.path().to_string_lossy().to_string());
+            } else if name.contains("paint") || name.contains("texgen") || name.contains("texture") {
+                texgen_path = Some(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    (vae_path, texgen_path)
 }
 
 /// A `.safetensors` model is a text LLM if the sibling `config.json` in the
@@ -2809,6 +2881,7 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
         detect_hf_config_dir_modality(dir)
     };
     let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(dir) } else { None };
+    let (mesh_vae_path, mesh_texgen_path) = if modality == "mesh3d" { find_mesh3d_siblings(dir) } else { (None, None) };
 
     Some(DetectedModelEntry {
         name: dir.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
@@ -2818,6 +2891,8 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
         image_input_available: modality == "vision",
         mmproj_path: None,
         mesh_input_kinds,
+        mesh_vae_path,
+        mesh_texgen_path,
         modality,
     })
 }
@@ -2827,6 +2902,29 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
     for child in children.flatten() {
         let path = child.path();
         if path.is_dir() {
+            // Multi-component 3D mesh repos (e.g. Hunyuan3D-2.1) have no root
+            // config.json / model_index.json, so hf_model_dir_entry() would miss
+            // them and the scanner would recurse into subfolders (dit/vae/...),
+            // emitting nested weight files as standalone models. The mesh3d
+            // backend needs the repo-root folder to locate those subfolders, so
+            // short-circuit on the dir name before recursing.
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+            if is_mesh3d_name(&dir_name) {
+                let (mesh_vae_path, mesh_texgen_path) = find_mesh3d_siblings(&path);
+                entries.push(DetectedModelEntry {
+                    name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    size_bytes: sum_model_weight_bytes(&path),
+                    max_context_size: None,
+                    image_input_available: false,
+                    mmproj_path: None,
+                    mesh_input_kinds: detect_mesh_input_kinds(&path),
+                    mesh_vae_path,
+                    mesh_texgen_path,
+                    modality: "mesh3d".to_string(),
+                });
+                continue;
+            }
             if let Some(entry) = hf_model_dir_entry(&path) {
                 // A HF model dir is emitted as ONE entry — don't also descend
                 // into it to emit per-file entries for its shards/components.
@@ -2852,6 +2950,8 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 image_input_available: modality == "vision" || sibling_mmproj.is_some(),
                 mmproj_path: sibling_mmproj,
                 mesh_input_kinds,
+                mesh_vae_path: None,
+                mesh_texgen_path: None,
                 modality,
             });
         }
@@ -2972,7 +3072,47 @@ struct HfModelResult {
 /// Single source of truth for catalog gating.
 const SUPPORTED_FORMATS: &[&str] = &["gguf", "safetensors"];
 
+/// Sanitize HF token by keeping only ASCII graphic characters (0x21-0x7E).
+/// This strips all invisible Unicode characters that may have been pasted from browsers.
+fn sanitize_hf_token(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_graphic()).collect()
+}
+
+/// Read HF token: runtime override (from UI) > HF_TOKEN env var > cached token file.
+async fn resolve_hf_token(state_token: &Arc<tokio::sync::Mutex<Option<String>>>) -> Option<String> {
+    {
+        let lock = state_token.lock().await;
+        if let Some(ref t) = *lock {
+            if !t.is_empty() {
+                return Some(t.clone());
+            }
+        }
+    }
+    if let Ok(t) = std::env::var("HF_TOKEN") {
+        let t = sanitize_hf_token(&t);
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    if let Ok(t) = std::env::var("HUGGING_FACE_HUB_TOKEN") {
+        let t = sanitize_hf_token(&t);
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    let token_path = std::path::PathBuf::from(home).join(".cache").join("huggingface").join("token");
+    if let Ok(t) = tokio::fs::read_to_string(&token_path).await {
+        let t = sanitize_hf_token(&t);
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    None
+}
+
 async fn hf_search(
+    State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HfSearchQuery>,
 ) -> Json<Vec<HfModelResult>> {
     // NOTE: the Hugging Face `filter` param ANDs its tags together, so a single
@@ -2997,11 +3137,9 @@ async fn hf_search(
             }
         }
     }
-    let formats: &[&str] = if format_tags.is_empty() {
-        SUPPORTED_FORMATS
-    } else {
-        &format_tags
-    };
+    if format_tags.is_empty() && extra_tags.is_empty() {
+        format_tags = SUPPORTED_FORMATS.to_vec();
+    }
     let sort = params.sort.unwrap_or_else(|| "trendingScore".to_string());
     // With no search term the panel is in "browse" mode, so surface a fuller top
     // list; a real query narrows things down and 20 keeps it snappy.
@@ -3016,14 +3154,23 @@ async fn hf_search(
         Err(_) => return Json(Vec::new()),
     };
 
+    let token = resolve_hf_token(&state.hf_token).await;
+
     let mut merged: Vec<HfModelResult> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for format in formats {
+    // When no format tags, do a single pass with just the extra tags.
+    // When format tags exist, do one pass per format (OR semantics).
+    let passes: Vec<&str> = if format_tags.is_empty() { vec![""] } else { format_tags };
+    for format in &passes {
         if merged.len() >= limit {
             break;
         }
-        let mut filter_tags = vec![format.to_string()];
+        let mut filter_tags: Vec<String> = if format.is_empty() {
+            Vec::new()
+        } else {
+            vec![format.to_string()]
+        };
         filter_tags.extend(extra_tags.iter().cloned());
 
         let mut request = client
@@ -3047,6 +3194,10 @@ async fn hf_search(
 
         if let Some(q) = params.q.as_ref().filter(|q| !q.is_empty()) {
             request = request.query(&[("search", q.as_str())]);
+        }
+
+        if let Some(ref t) = token {
+            request = request.header("Authorization", format!("Bearer {}", t));
         }
 
         let response = match request.send().await {
@@ -3152,6 +3303,13 @@ fn hf_file_base_name(rfilename: &str) -> &str {
     rfilename.rsplit('/').next().unwrap_or(rfilename)
 }
 
+/// The parent directory of a repo-relative filename, or `""` for root-level
+/// files. Used to scope weight-file variant grouping to files that live
+/// side by side in the same folder.
+fn parent_dir(filename: &str) -> &str {
+    filename.rfind('/').map(|i| &filename[..i]).unwrap_or("")
+}
+
 /// `-\d+-of-\d+\.(safetensors|gguf)` — `base` must already be lowercased.
 fn is_shard_filename(base: &str) -> bool {
     let stem = if let Some(stem) = base.strip_suffix(".safetensors") {
@@ -3188,7 +3346,7 @@ fn classify_hf_file_role(rfilename: &str) -> String {
     if base.contains("mmproj") {
         return "mmproj".to_string();
     }
-    if base == "config.json" || base == "generation_config.json" {
+    if base == "config.json" || base == "generation_config.json" || base == "config.yaml" {
         return "config".to_string();
     }
     if base.starts_with("tokenizer") || matches!(base, "vocab.json" | "merges.txt" | "special_tokens_map.json") {
@@ -3300,6 +3458,7 @@ fn pick_variant_weights_file<'a>(
 }
 
 async fn hf_files(
+    State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HfFilesQuery>,
 ) -> Json<HfFilesResponse> {
     fn empty_response() -> HfFilesResponse {
@@ -3314,8 +3473,14 @@ async fn hf_files(
         Err(_) => return Json(empty_response()),
     };
 
+    let token = resolve_hf_token(&state.hf_token).await;
+
     let url = format!("https://huggingface.co/api/models/{}", params.repo);
-    let response = match client.get(&url).send().await {
+    let mut req = client.get(&url);
+    if let Some(ref t) = token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let response = match req.send().await {
         Ok(resp) => resp,
         Err(err) => {
             tracing::warn!("hf-files request failed: {err}");
@@ -3342,7 +3507,11 @@ async fn hf_files(
         params.repo
     );
     let mut tree_files: Vec<(String, Option<u64>)> = Vec::new();
-    match client.get(&tree_url).send().await {
+    let mut tree_req = client.get(&tree_url);
+    if let Some(ref t) = token {
+        tree_req = tree_req.header("Authorization", format!("Bearer {}", t));
+    }
+    match tree_req.send().await {
         Ok(resp) => match resp.json::<Vec<HfTreeEntry>>().await {
             Ok(entries) => {
                 for entry in entries {
@@ -3382,19 +3551,30 @@ async fn hf_files(
             .collect()
     };
 
-    // Group standalone weight files into interchangeable variants when a
-    // repo offers 2+ alternatives of the same weight format (different
-    // quants/precisions of the same model).
-    let gguf_weight_count = files.iter().filter(|f| f.role == "weights" && standalone_weight_ext(&f.filename) == Some("gguf")).count();
-    let safetensors_weight_count = files.iter().filter(|f| f.role == "weights" && standalone_weight_ext(&f.filename) == Some("safetensors")).count();
+    // Group standalone weight files into interchangeable variants when a repo
+    // offers 2+ alternatives of the same weight format IN THE SAME DIRECTORY
+    // (different quants/precisions of the same model living side by side).
+    // Directory-scoped so a component-pipeline repo's per-subfolder weights
+    // (e.g. transformer/model.safetensors) never get lumped in with an
+    // unrelated root-level convenience copy of the same extension.
+    let mut variant_counts: std::collections::HashMap<(String, &'static str), usize> = std::collections::HashMap::new();
+    for f in files.iter() {
+        if f.role != "weights" {
+            continue;
+        }
+        if let Some(ext) = standalone_weight_ext(&f.filename) {
+            *variant_counts.entry((parent_dir(&f.filename).to_string(), ext)).or_insert(0) += 1;
+        }
+    }
     for f in files.iter_mut() {
         if f.role != "weights" {
             continue;
         }
-        match standalone_weight_ext(&f.filename) {
-            Some("gguf") if gguf_weight_count >= 2 => f.variant_group = Some("gguf".to_string()),
-            Some("safetensors") if safetensors_weight_count >= 2 => f.variant_group = Some("safetensors".to_string()),
-            _ => {}
+        if let Some(ext) = standalone_weight_ext(&f.filename) {
+            let dir = parent_dir(&f.filename).to_string();
+            if variant_counts.get(&(dir, ext)).copied().unwrap_or(0) >= 2 {
+                f.variant_group = Some(ext.to_string());
+            }
         }
     }
 
@@ -3524,9 +3704,10 @@ async fn hf_download(
     let repo = payload.repo.clone();
     let filename = payload.filename.clone();
     let target_path = save_path.clone();
+    let hf_token = resolve_hf_token(&state.hf_token).await;
 
     tokio::spawn(async move {
-        if let Err(err) = run_hf_download(&repo, &filename, &target_path, &downloads_map, &cancel_flag).await {
+        if let Err(err) = run_hf_download(&repo, &filename, &target_path, &downloads_map, &cancel_flag, hf_token).await {
             tracing::warn!("hf-download failed for {filename}: {err}");
             let mut downloads = downloads_map.lock().await;
             if let Some(entry) = downloads.get_mut(&filename) {
@@ -3540,6 +3721,118 @@ async fn hf_download(
         status: "downloading",
         path: save_path_string,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct HfTokenRequest {
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HfTokenResponse {
+    status: &'static str,
+    has_token: bool,
+}
+
+async fn hf_set_token(
+    State(state): State<AppState>,
+    Json(payload): Json<HfTokenRequest>,
+) -> Json<HfTokenResponse> {
+    let mut lock = state.hf_token.lock().await;
+    let sanitized = sanitize_hf_token(&payload.token);
+    let has = !sanitized.is_empty();
+    *lock = if has { Some(sanitized) } else { None };
+    Json(HfTokenResponse { status: "ok", has_token: has })
+}
+
+async fn hf_get_token_status(
+    State(state): State<AppState>,
+) -> Json<HfTokenResponse> {
+    let token = resolve_hf_token(&state.hf_token).await;
+    Json(HfTokenResponse { status: "ok", has_token: token.is_some() })
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPathRequest {
+    path: String,
+    /// Optional companion vision projector file belonging exclusively to this
+    /// model — deleted alongside it if present. Never used to widen deletion
+    /// to anything else in the folder.
+    #[serde(default)]
+    mmproj_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelActionResponse {
+    status: &'static str,
+}
+
+async fn open_model_folder(
+    Json(payload): Json<ModelPathRequest>,
+) -> Result<Json<ModelActionResponse>, (axum::http::StatusCode, String)> {
+    let path = std::path::Path::new(&payload.path);
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "Model path not found".into()));
+    }
+    let parent = path.parent()
+        .ok_or((axum::http::StatusCode::BAD_REQUEST, "Model path has no parent directory".into()))?;
+
+    std::process::Command::new("explorer")
+        .arg(parent)
+        .spawn()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ModelActionResponse { status: "ok" }))
+}
+
+async fn delete_model(
+    Json(payload): Json<ModelPathRequest>,
+) -> Result<Json<ModelActionResponse>, (axum::http::StatusCode, String)> {
+    let path = std::path::Path::new(&payload.path);
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "Model path not found".into()));
+    }
+
+    let models_root = resolve_models_dir()
+        .ok_or((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve models directory".into()))?;
+    let models_root_canon = models_root.canonicalize().unwrap_or_else(|_| models_root.clone());
+
+    // A catalog entry's `path` either points directly at a model's own
+    // exclusive directory (HF-style repos, mesh3d bundles — safe to remove
+    // wholesale) or at a single loose file living alongside other models'
+    // files (e.g. GGUFs dropped straight in the models folder or sharing a
+    // repo subfolder). For the file case we only ever remove that one file
+    // (plus its own mmproj, if given) — never its containing folder — so a
+    // single delete can never take out sibling models.
+    let is_dir_entry = path.is_dir();
+    let target = path.to_path_buf();
+    let target_canon = target.canonicalize().unwrap_or_else(|_| target.clone());
+
+    // Hard safety invariant: never delete the models root itself, nor
+    // anything that isn't inside it.
+    if target_canon == models_root_canon || !target_canon.starts_with(&models_root_canon) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Refusing to delete the models root or a path outside it".into()));
+    }
+
+    if is_dir_entry {
+        std::fs::remove_dir_all(&target)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    } else {
+        std::fs::remove_file(&target)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if let Some(mmproj) = payload.mmproj_path.as_ref() {
+            let mmproj_path = std::path::Path::new(mmproj);
+            if mmproj_path.is_file() {
+                let mmproj_canon = mmproj_path.canonicalize().unwrap_or_else(|_| mmproj_path.to_path_buf());
+                if mmproj_canon.starts_with(&models_root_canon) {
+                    let _ = std::fs::remove_file(mmproj_path);
+                }
+            }
+        }
+    }
+
+    Ok(Json(ModelActionResponse { status: "deleted" }))
 }
 
 /// Turn a HuggingFace repo id (`org/model`) into a filesystem-safe folder name.
@@ -3558,6 +3851,7 @@ async fn run_hf_download(
     target_path: &std::path::Path,
     downloads_map: &Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
     cancel_flag: &Arc<AtomicBool>,
+    hf_token: Option<String>,
 ) -> Result<(), String> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -3571,17 +3865,47 @@ async fn run_hf_download(
     let client = reqwest::Client::builder()
         .user_agent("antioom-ai/0.1")
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .http2_initial_stream_window_size(16 * 1024 * 1024)
+        .http2_initial_connection_window_size(16 * 1024 * 1024)
         .build()
         .map_err(|e| e.to_string())?;
 
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
-    let response = client
-        .get(&url)
+    let mut req = client.get(&url);
+    if let Some(ref t) = hf_token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let initial = req
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
         .map_err(|e| e.to_string())?;
+
+    let response = if initial.status().is_redirection() {
+        let location = initial
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .ok_or("redirect without Location header")?
+            .to_string();
+        let base = reqwest::Url::parse(&url).map_err(|e| e.to_string())?;
+        let redirect_url = base.join(&location).map_err(|e| e.to_string())?;
+        reqwest::Client::builder()
+            .user_agent("antioom-ai/0.1")
+            .no_proxy()
+            .http2_initial_stream_window_size(16 * 1024 * 1024)
+            .http2_initial_connection_window_size(16 * 1024 * 1024)
+            .build()
+            .map_err(|e| e.to_string())?
+            .get(redirect_url.as_str())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+    } else {
+        initial.error_for_status().map_err(|e| e.to_string())?
+    };
 
     let total_bytes = response.content_length();
     {

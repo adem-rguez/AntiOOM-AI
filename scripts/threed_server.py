@@ -403,11 +403,57 @@ class TripoSRAdapter(MeshAdapter):
         except ImportError:
             return False
 
+    @staticmethod
+    def _remap_ckpt(ckpt, model):
+        """Remap HF-ViT checkpoint keys to match the tsr package's custom ViT."""
+        model_keys = set(model.state_dict().keys())
+        if all(k in model_keys for k in ckpt.keys()):
+            return ckpt
+        remap = {}
+        for k, v in ckpt.items():
+            nk = k
+            # encoder.layer.N -> layers.N
+            nk = nk.replace(".encoder.layer.", ".layers.")
+            # attention.attention.query -> attention.q_proj
+            nk = nk.replace(".attention.attention.query.", ".attention.q_proj.")
+            nk = nk.replace(".attention.attention.key.", ".attention.k_proj.")
+            nk = nk.replace(".attention.attention.value.", ".attention.v_proj.")
+            nk = nk.replace(".attention.output.dense.", ".attention.o_proj.")
+            # intermediate.dense -> mlp.fc1, output.dense -> mlp.fc2
+            nk = nk.replace(".intermediate.dense.", ".mlp.fc1.")
+            nk = nk.replace(".output.dense.", ".mlp.fc2.")
+            remap[nk] = v
+        return remap
+
     def _load(self):
         if self._model is None:
             from tsr.system import TSR
+            from omegaconf import OmegaConf
             repo = self.model_path if os.path.isdir(self.model_path) else "stabilityai/TripoSR"
-            self._model = TSR.from_pretrained(repo, config_name="config.yaml", weight_name="model.ckpt")
+            config_name = "config.yaml"
+            weight_name = "model.ckpt"
+            if os.path.isdir(repo):
+                if not os.path.isfile(os.path.join(repo, config_name)) and os.path.isfile(os.path.join(repo, "resolved_config.json")):
+                    config_name = "resolved_config.json"
+                if not os.path.isfile(os.path.join(repo, weight_name)) and os.path.isfile(os.path.join(repo, "model.safetensors")):
+                    weight_name = "model.safetensors"
+            if os.path.isdir(repo):
+                cfg_path = os.path.join(repo, config_name)
+                weight_path = os.path.join(repo, weight_name)
+            else:
+                from huggingface_hub import hf_hub_download
+                cfg_path = hf_hub_download(repo_id=repo, filename=config_name)
+                weight_path = hf_hub_download(repo_id=repo, filename=weight_name)
+            cfg = OmegaConf.load(cfg_path)
+            OmegaConf.resolve(cfg)
+            self._model = TSR(cfg)
+            if weight_name.endswith(".safetensors"):
+                from safetensors.torch import load_file as load_safetensors
+                ckpt = load_safetensors(weight_path)
+            else:
+                ckpt = torch.load(weight_path, map_location="cpu")
+            ckpt = self._remap_ckpt(ckpt, self._model)
+            self._model.load_state_dict(ckpt)
             self._model.renderer.set_chunk_size(8192)
             if torch is not None and torch.cuda.is_available():
                 self._model.to("cuda")
@@ -426,6 +472,8 @@ class TripoSRAdapter(MeshAdapter):
             image = resize_foreground(image, foreground_ratio)
         except ImportError:
             pass  # fall back to using the raw image unsegmented
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
         device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
         with torch.no_grad():
@@ -467,14 +515,63 @@ class SF3DAdapter(MeshAdapter):
             raise ValueError("Stable Fast 3D requires an image input")
         model = self._load()
         image = images[0].convert("RGBA")
+        foreground_ratio = float(params.get("foreground_ratio") or 0.85)
+        try:
+            import rembg
+            from sf3d.utils import remove_background, resize_foreground
+            image = remove_background(image, rembg.new_session())
+            image = resize_foreground(image, foreground_ratio)
+        except ImportError:
+            pass
+        return self._generate_vertex_colored(model, image)
+
+    @staticmethod
+    def _generate_vertex_colored(model, image):
+        """Extract mesh geometry and query per-vertex colors from the triplane,
+        bypassing UV unwrapping and texture baking entirely."""
+        import numpy as np
+        from contextlib import nullcontext
+        from sf3d.utils import create_intrinsic_from_fov_deg, default_cond_c2w
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         with torch.no_grad():
-            result = model.run_image([image], bake_resolution=1024, remesh="none")
-        # `run_image` may return a bare mesh or a `(mesh, glob_dict)` tuple
-        # depending on sf3d version; normalize both before converting.
-        mesh = result[0] if isinstance(result, tuple) else result
-        if isinstance(mesh, list):
-            mesh = mesh[0]
-        return _to_trimesh(mesh)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16) if device == "cuda" else nullcontext():
+                mask_cond, rgb_cond = model.prepare_image(image)
+                c2w_cond = default_cond_c2w(model.cfg.default_distance).to(model.device)
+                intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_deg(
+                    model.cfg.default_fovy_deg, model.cfg.cond_image_size, model.cfg.cond_image_size,
+                )
+                batch = {
+                    "rgb_cond": rgb_cond,
+                    "mask_cond": mask_cond,
+                    "c2w_cond": c2w_cond.view(1, 1, 4, 4),
+                    "intrinsic_cond": intrinsic.to(model.device).view(1, 1, 3, 3),
+                    "intrinsic_normed_cond": intrinsic_normed_cond.to(model.device).view(1, 1, 3, 3),
+                }
+                batch["rgb_cond"] = model.image_processor(batch["rgb_cond"], model.cfg.cond_image_size)
+                batch["mask_cond"] = model.image_processor(batch["mask_cond"], model.cfg.cond_image_size)
+                scene_codes, _ = model.get_scene_codes(batch)
+                meshes = model.triplane_to_meshes(scene_codes)
+                mesh = meshes[0]
+                if mesh.v_pos.shape[0] == 0:
+                    return trimesh.Trimesh()
+                tri_query = model.query_triplane(mesh.v_pos.unsqueeze(0), scene_codes[0:1])[0]
+                decoded = model.decoder(tri_query, exclude=["density", "vertex_offset"])
+                colors = decoded["features"].squeeze(0)
+                colors = colors.float().clamp(0, 1).cpu().numpy()
+                colors_uint8 = (colors * 255).astype(np.uint8)
+                if colors_uint8.shape[-1] == 3:
+                    alpha = np.full((colors_uint8.shape[0], 1), 255, dtype=np.uint8)
+                    colors_uint8 = np.concatenate([colors_uint8, alpha], axis=-1)
+
+        verts = mesh.v_pos.float().cpu().numpy()
+        faces = mesh.t_pos_idx.cpu().numpy()
+        tmesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=colors_uint8)
+        rot = trimesh.transformations.rotation_matrix(np.radians(-90), [1, 0, 0])
+        tmesh.apply_transform(rot)
+        tmesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 1, 0]))
+        tmesh.invert()
+        return tmesh
 
 
 class TrellisAdapter(MeshAdapter):
@@ -589,61 +686,204 @@ class Hunyuan3DAdapter(MeshAdapter):
             return False
 
     @staticmethod
-    def _has_shape_model_files(subfolder_path):
-        if not os.path.exists(os.path.join(subfolder_path, "config.yaml")):
+    def _has_model_weights(subfolder_path):
+        """Check if a subfolder contains model weight files (.ckpt or .safetensors)."""
+        if not os.path.isdir(subfolder_path):
             return False
-        return any(name.startswith("model") for name in os.listdir(subfolder_path))
+        return any(
+            name.startswith("model") and (name.endswith(".ckpt") or name.endswith(".safetensors"))
+            for name in os.listdir(subfolder_path)
+        )
+
+    @staticmethod
+    def _find_ckpt(dit_dir):
+        """Find the best checkpoint file in a dit directory.
+        Prefers .ckpt over .safetensors, fp16 over full precision."""
+        candidates = [
+            f for f in os.listdir(dit_dir)
+            if f.startswith("model") and (f.endswith(".ckpt") or f.endswith(".safetensors"))
+        ]
+        if not candidates:
+            return None, False
+        for preferred in ("model.fp16.ckpt", "model.fp16.safetensors", "model.ckpt", "model.safetensors"):
+            if preferred in candidates:
+                return os.path.join(dit_dir, preferred), preferred.endswith(".safetensors")
+        return os.path.join(dit_dir, candidates[0]), candidates[0].endswith(".safetensors")
+
+    @staticmethod
+    def _derive_hf_repo_id(folder_name):
+        """Derive HF repo id and dit subfolder from a local folder name.
+        e.g. 'tencent_Hunyuan3D-2.1' -> ('tencent/Hunyuan3D-2.1', 'hunyuan3d-dit-v2-1')"""
+        match = re.search(r"Hunyuan3D-(2(?:\.\d+)?)", folder_name, re.IGNORECASE)
+        if not match:
+            return None, None
+        version = match.group(1)
+        minor = version.split(".")[1] if "." in version else "0"
+        repo_id = f"tencent/Hunyuan3D-{version}"
+        dit_subfolder = f"hunyuan3d-dit-v2-{minor}"
+        return repo_id, dit_subfolder
 
     def _resolve_shape_source(self):
-        """Locate the Hunyuan3D SHAPE-generation DiT model, distinguishing it
-        from the paint/texture pipeline that may be the only thing downloaded
-        locally. Returns (model_path, subfolder) suitable for
-        `Hunyuan3DDiTFlowMatchingPipeline.from_pretrained`, where model_path is
-        either a local repo-root directory or a HF hub repo id."""
+        """Locate the Hunyuan3D SHAPE-generation DiT model directory.
+        Returns (repo_root, dit_subfolder_name) where repo_root is always
+        a local directory path (never an HF repo id)."""
         path = os.path.normpath(self.model_path) if self.model_path else ""
         parent = os.path.dirname(path)
-        # model_path may already be the repo root, the paint subfolder, or the
-        # dit subfolder itself -- try it and its parent as repo-root candidates.
         candidates = [d for d in dict.fromkeys([path, parent]) if d and os.path.isdir(d)]
 
         for repo_root in candidates:
             basename = os.path.basename(repo_root).lower()
-            if "dit" in basename and self._has_shape_model_files(repo_root):
-                # repo_root is actually the shape subfolder itself.
+            if "dit" in basename and self._has_model_weights(repo_root):
                 return os.path.dirname(repo_root), os.path.basename(repo_root)
             for entry in sorted(os.listdir(repo_root)):
                 entry_path = os.path.join(repo_root, entry)
-                if "dit" in entry.lower() and os.path.isdir(entry_path) and self._has_shape_model_files(entry_path):
+                if "dit" in entry.lower() and os.path.isdir(entry_path) and self._has_model_weights(entry_path):
                     return repo_root, entry
-
-        # No local shape model on disk; fall back to the HF hub, deriving the
-        # repo id/subfolder from the local folder naming convention
-        # (e.g. "tencent_Hunyuan3D-2.1" -> "tencent/Hunyuan3D-2.1").
-        for repo_root in candidates:
-            match = re.search(r"Hunyuan3D-(2(?:\.\d+)?)", os.path.basename(repo_root), re.IGNORECASE)
-            if match:
-                version = match.group(1)
-                minor = version.split(".")[1] if "." in version else "0"
-                return f"tencent/Hunyuan3D-{version}", f"hunyuan3d-dit-v2-{minor}"
 
         raise RuntimeError(
             f"Hunyuan3D shape-generation model not found for '{self.model_path}'. "
-            f"Expected a local 'hunyuan3d-dit-v2-*' subfolder (the shape DiT "
-            f"model) under the Hunyuan3D repo root, but none was found. "
-            f"It looks like only the paint/texture pipeline was downloaded. "
-            f"Download the 'hunyuan3d-dit-v2-*' subfolder from the Hunyuan3D "
-            f"repo on Hugging Face (e.g. tencent/Hunyuan3D-2.1), or point "
-            f"--model-path at a plain 'tencent_Hunyuan3D-2.x' folder name to "
-            f"let it auto-download from the hub."
+            f"Expected a local 'hunyuan3d-dit-v2-*' subfolder with model weight "
+            f"files under the Hunyuan3D repo root."
         )
 
-    def _load(self):
-        if self._pipeline is None:
-            from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-            model_path, subfolder = self._resolve_shape_source()
-            self._pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                model_path, subfolder=subfolder
+    @staticmethod
+    def _ensure_config_yaml(dit_dir, repo_root):
+        """Download config.yaml from HF if missing locally."""
+        config_path = os.path.join(dit_dir, "config.yaml")
+        if os.path.exists(config_path):
+            return config_path
+        repo_id, _ = Hunyuan3DAdapter._derive_hf_repo_id(os.path.basename(repo_root))
+        if not repo_id:
+            raise FileNotFoundError(
+                f"config.yaml missing from {dit_dir} and cannot derive HF repo id "
+                f"to download it. Please download config.yaml manually."
             )
+        dit_name = os.path.basename(dit_dir)
+        hf_url = f"https://huggingface.co/{repo_id}/resolve/main/{dit_name}/config.yaml"
+        print(f"Hunyuan3D: config.yaml missing, downloading from {hf_url}", file=sys.stderr)
+        try:
+            req = urllib.request.Request(hf_url, headers={"User-Agent": "antioom-ai/0.1"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            with open(config_path, "wb") as f:
+                f.write(data)
+            print(f"Hunyuan3D: config.yaml saved to {config_path}", file=sys.stderr)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"config.yaml missing from {dit_dir} and download failed: {e}"
+            ) from e
+        return config_path
+
+    @staticmethod
+    def _needs_cpu_offload(ckpt_path):
+        ckpt_bytes = os.path.getsize(ckpt_path)
+        if not torch.cuda.is_available():
+            return True
+        vram_free = torch.cuda.mem_get_info()[0]
+        return ckpt_bytes * 1.3 > vram_free
+
+    @staticmethod
+    def _load_ckpt_component(ckpt_path, component_key, use_safetensors):
+        """Load a single component's state dict from the checkpoint without
+        keeping the full checkpoint in memory."""
+        if use_safetensors:
+            import safetensors.torch
+            full = safetensors.torch.load_file(ckpt_path, device="cpu")
+            prefix = component_key + "."
+            sd = {k[len(prefix):]: v for k, v in full.items() if k.startswith(prefix)}
+            del full
+        else:
+            import gc
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            sd = ckpt.pop(component_key, {})
+            del ckpt
+            gc.collect()
+        return sd
+
+    def _load(self):
+        if self._pipeline is not None:
+            return self._pipeline
+
+        import gc
+        import yaml
+        from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+        from hy3dgen.shapegen.pipelines import instantiate_from_config
+
+        repo_root, subfolder = self._resolve_shape_source()
+        dit_dir = os.path.join(repo_root, subfolder)
+        config_path = self._ensure_config_yaml(dit_dir, repo_root)
+        ckpt_path, use_safetensors = self._find_ckpt(dit_dir)
+        if not ckpt_path:
+            raise FileNotFoundError(f"No model weights found in {dit_dir}")
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        dtype = torch.float16
+        has_cuda = torch.cuda.is_available()
+        offload = self._needs_cpu_offload(ckpt_path)
+
+        # The MoE DiT is 3B params — 12 GB in fp32. Use meta-device
+        # construction + assign=True so we never materialise empty fp32
+        # weights. Conditioner and VAE are small (~0.6 GB each) and can
+        # be constructed normally; the VAE in particular has buffers not
+        # in the checkpoint that must keep their init values.
+
+        # When offloading, DiT + conditioner stay on CPU and get moved to
+        # CUDA lazily by accelerate hooks. VAE stays on CUDA permanently
+        # (only 0.66 GB) because _export() calls vae() then vae.latents2mesh()
+        # in sequence — offload hooks would move it back to CPU between calls.
+        dit_device = "cpu" if offload else ("cuda" if has_cuda else "cpu")
+        vae_device = "cuda" if has_cuda else "cpu"
+
+        print("Hunyuan3D: loading DiT model...", file=sys.stderr, flush=True)
+        with torch.device("meta"):
+            model = instantiate_from_config(config["model"])
+        sd = self._load_ckpt_component(ckpt_path, "model", use_safetensors)
+        sd = {k: v.to(dtype=dtype) for k, v in sd.items()}
+        model.load_state_dict(sd, strict=True, assign=True)
+        del sd; gc.collect()
+        model = model.to_empty(device=dit_device).to(dtype=dtype)
+        gc.collect()
+        if dit_device == "cuda":
+            torch.cuda.empty_cache()
+
+        print("Hunyuan3D: loading conditioner...", file=sys.stderr, flush=True)
+        conditioner = instantiate_from_config(config["conditioner"])
+        sd = self._load_ckpt_component(ckpt_path, "conditioner", use_safetensors)
+        if sd:
+            conditioner.load_state_dict(sd)
+        del sd; gc.collect()
+        conditioner = conditioner.to(device=dit_device, dtype=dtype)
+
+        print("Hunyuan3D: loading VAE...", file=sys.stderr, flush=True)
+        vae = instantiate_from_config(config["vae"])
+        sd = self._load_ckpt_component(ckpt_path, "vae", use_safetensors)
+        vae.load_state_dict(sd, strict=False)
+        del sd; gc.collect()
+        vae = vae.to(device=vae_device, dtype=dtype)
+
+        image_processor = instantiate_from_config(config["image_processor"])
+        scheduler = instantiate_from_config(config["scheduler"])
+
+        self._pipeline = Hunyuan3DDiTFlowMatchingPipeline(
+            vae=vae, model=model, scheduler=scheduler,
+            conditioner=conditioner, image_processor=image_processor,
+            device="cuda" if has_cuda else "cpu",
+            dtype=dtype,
+        )
+
+        if offload:
+            print("Hunyuan3D: enabling CPU offload (DiT + conditioner)...",
+                  file=sys.stderr, flush=True)
+            from accelerate import cpu_offload_with_hook
+            hook = None
+            for part in ("conditioner", "model"):
+                mod = getattr(self._pipeline, part, None)
+                if isinstance(mod, torch.nn.Module):
+                    _, hook = cpu_offload_with_hook(mod, "cuda", prev_module_hook=hook)
+            self._pipeline.device = torch.device("cuda")
+
         return self._pipeline
 
     def generate(self, input_kind, prompt, images, params):
@@ -654,9 +894,17 @@ class Hunyuan3DAdapter(MeshAdapter):
         if not images:
             raise ValueError("Hunyuan3D requires at least one image input")
         pipeline = self._load()
-        # Result is a list whose first item is already a `trimesh.Trimesh`;
-        # `_to_trimesh` passes it through unchanged.
-        result = pipeline(image=images[0])
+
+        steps = int(params.get("steps") or 30)
+        guidance_scale = float(params.get("guidance_scale") or 5.0)
+        octree_resolution = int(params.get("octree_resolution") or 256)
+
+        result = pipeline(
+            image=images[0],
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            octree_resolution=octree_resolution,
+        )
         return _to_trimesh(result[0])
 
 
@@ -1130,6 +1378,8 @@ class Handler(BaseHTTPRequestHandler):
 
             self._send_json(200, {"mesh_base64": mesh_base64, "format": fmt})
         except Exception as e:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             _progress_update(status="error", phase="error", message=str(e))
             self._send_json(500, {"error": str(e)})
 
