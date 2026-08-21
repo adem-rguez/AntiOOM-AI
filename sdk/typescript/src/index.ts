@@ -27,7 +27,7 @@ export interface ChatCompletionRequest {
   max_tokens?: number;
 }
 
-export class AIATMClient {
+export class DisposClient {
   private baseUrl: string;
 
   constructor(baseUrl: string = 'http://localhost:8080') {

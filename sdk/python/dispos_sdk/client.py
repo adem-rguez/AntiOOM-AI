@@ -1,8 +1,8 @@
 import requests
 from typing import Dict, Any, Optional
 
-class AIATMClient:
-    """Python Client SDK for AIATM Local Inference Daemon REST & Fit Estimator APIs."""
+class DisposClient:
+    """Python Client SDK for DisposAI Local Inference Daemon REST & Fit Estimator APIs."""
     
     def __init__(self, base_url: str = "http://localhost:8080"):
         self.base_url = base_url.rstrip("/")

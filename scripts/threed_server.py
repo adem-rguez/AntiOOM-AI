@@ -762,7 +762,7 @@ class Hunyuan3DAdapter(MeshAdapter):
         hf_url = f"https://huggingface.co/{repo_id}/resolve/main/{dit_name}/config.yaml"
         print(f"Hunyuan3D: config.yaml missing, downloading from {hf_url}", file=sys.stderr)
         try:
-            req = urllib.request.Request(hf_url, headers={"User-Agent": "antioom-ai/0.1"})
+            req = urllib.request.Request(hf_url, headers={"User-Agent": "dispos-ai/0.1"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
             with open(config_path, "wb") as f:

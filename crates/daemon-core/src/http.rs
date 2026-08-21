@@ -324,7 +324,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
         .map(|name| ModelItem {
             id: name,
             object: "model",
-            owned_by: "aiatm",
+            owned_by: "dispos",
         })
         .collect();
     Json(ModelListResponse {
@@ -385,7 +385,7 @@ async fn dashboard_landing() -> Html<&'static str> {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AIATM Desktop - Local Multimodal Inference Studio</title>
+    <title>Dispos Studio - Local Multimodal Inference</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -812,7 +812,7 @@ async fn dashboard_landing() -> Html<&'static str> {
     <header>
         <div class="logo-group">
             <div class="logo-icon">AI</div>
-            <div class="logo-title">AIATM Desktop</div>
+            <div class="logo-title">Dispos Studio</div>
             <span class="version-tag">v0.1.0 Daemon</span>
         </div>
         
@@ -874,7 +874,7 @@ async fn dashboard_landing() -> Html<&'static str> {
                         <div class="message-row">
                             <div class="avatar ai">AI</div>
                             <div class="message-bubble">
-                                Hello! I am your AIATM Local Inference engine running with full CUDA GPU acceleration.
+                                Hello! I am your DisposAI Local Inference engine running with full CUDA GPU acceleration.
                                 <br><br>Select your model GGUF path below and send a prompt to generate responses at over 120+ tokens/sec!
                             </div>
                         </div>
@@ -888,7 +888,7 @@ async fn dashboard_landing() -> Html<&'static str> {
                             </div>
                         </div>
                         <div class="chat-textarea-wrapper">
-                            <textarea id="chatInput" placeholder="Ask AIATM anything..." onkeydown="handleChatKey(event)"></textarea>
+                            <textarea id="chatInput" placeholder="Ask DisposAI anything..." onkeydown="handleChatKey(event)"></textarea>
                             <button class="send-btn" onclick="sendChatMessage()"><i class="fa-solid fa-paper-plane"></i></button>
                         </div>
                     </div>
@@ -938,7 +938,7 @@ async fn dashboard_landing() -> Html<&'static str> {
                         <br>
                         <div class="form-group">
                             <label>Input Text</label>
-                            <input type="text" id="ttsInput" value="Welcome to the AIATM Local Inference Daemon. High-speed local audio generation.">
+                            <input type="text" id="ttsInput" value="Welcome to the DisposAI Local Inference Daemon. High-speed local audio generation.">
                         </div>
                         <button class="btn-action" onclick="synthesizeSpeech()"><i class="fa-solid fa-play"></i> Synthesize Speech</button>
                         <div id="audioPlayerContainer"></div>
@@ -2958,15 +2958,15 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
     }
 }
 
-/// Locate AIATM's own `models` directory without depending on how the daemon
+/// Locate DisposAI's own `models` directory without depending on how the daemon
 /// was launched. This supports development builds, packaged binaries, and an
-/// explicit deployment override through `AIATM_MODELS_DIR`.
+/// explicit deployment override through `DISPOS_MODELS_DIR`.
 /// Resolve the local models directory using the same search order as the
 /// model catalog. Returns the first existing directory found.
 fn resolve_models_dir() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(directory) = std::env::var("AIATM_MODELS_DIR") {
+    if let Ok(directory) = std::env::var("DISPOS_MODELS_DIR") {
         candidates.push(std::path::PathBuf::from(directory));
     }
     if let Ok(current_dir) = std::env::current_dir() {
@@ -3147,7 +3147,7 @@ async fn hf_search(
     let limit = if has_query { 20usize } else { 50usize };
 
     let client = match reqwest::Client::builder()
-        .user_agent("antioom-ai/0.1")
+        .user_agent("dispos-ai/0.1")
         .build()
     {
         Ok(c) => c,
@@ -3466,7 +3466,7 @@ async fn hf_files(
     }
 
     let client = match reqwest::Client::builder()
-        .user_agent("antioom-ai/0.1")
+        .user_agent("dispos-ai/0.1")
         .build()
     {
         Ok(c) => c,
@@ -3863,7 +3863,7 @@ async fn run_hf_download(
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("antioom-ai/0.1")
+        .user_agent("dispos-ai/0.1")
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .http2_initial_stream_window_size(16 * 1024 * 1024)
@@ -3891,7 +3891,7 @@ async fn run_hf_download(
         let base = reqwest::Url::parse(&url).map_err(|e| e.to_string())?;
         let redirect_url = base.join(&location).map_err(|e| e.to_string())?;
         reqwest::Client::builder()
-            .user_agent("antioom-ai/0.1")
+            .user_agent("dispos-ai/0.1")
             .no_proxy()
             .http2_initial_stream_window_size(16 * 1024 * 1024)
             .http2_initial_connection_window_size(16 * 1024 * 1024)

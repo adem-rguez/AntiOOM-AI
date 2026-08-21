@@ -11,7 +11,7 @@ app.on('quit', () => console.log('[Electron Lifecycle] quit'));
 app.on('child-process-gone', (e, details) => console.log('[Electron Lifecycle] child-process-gone:', details));
 app.on('render-process-gone', (e, webContents, details) => console.log('[Electron Lifecycle] render-process-gone:', details));
 
-const distPath = process.env.AIATM_DIST_PATH || path.join(__dirname, 'dist', 'index.html');
+const distPath = process.env.DISPOS_DIST_PATH || path.join(__dirname, 'dist', 'index.html');
 
 let win = null;
 
@@ -22,7 +22,7 @@ function createWindow() {
     height: 850,
     minWidth: 1000,
     minHeight: 650,
-    title: 'AIATM Desktop Studio',
+    title: 'Dispos Studio',
     backgroundColor: '#07090e',
     show: true,
     webPreferences: {

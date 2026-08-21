@@ -105,11 +105,11 @@ impl SdBackend {
     }
 
     /// Locate the `stable-diffusion.cpp` CLI executable. Checked in order:
-    /// an explicit `AIATM_SD_BINARY` env var override, known install
+    /// an explicit `DISPOS_SD_BINARY` env var override, known install
     /// locations (mirrors `llama-backend`'s `find_llama_server_binary`), then
     /// the system PATH.
     fn find_sd_binary() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("AIATM_SD_BINARY") {
+        if let Ok(p) = std::env::var("DISPOS_SD_BINARY") {
             let path = PathBuf::from(p);
             if path.exists() {
                 return Some(path);
@@ -238,13 +238,13 @@ impl SdBackend {
         found
     }
 
-    /// Locate AIATM's `models` directory the same way `daemon-core` does
-    /// (`AIATM_MODELS_DIR` override, then walking up from the current/exe
+    /// Locate DisposAI's `models` directory the same way `daemon-core` does
+    /// (`DISPOS_MODELS_DIR` override, then walking up from the current/exe
     /// directory, then the workspace source tree for dev builds).
     fn resolve_models_root() -> Option<PathBuf> {
         let mut candidates = Vec::new();
 
-        if let Ok(directory) = std::env::var("AIATM_MODELS_DIR") {
+        if let Ok(directory) = std::env::var("DISPOS_MODELS_DIR") {
             candidates.push(PathBuf::from(directory));
         }
         if let Ok(current_dir) = std::env::current_dir() {
@@ -402,7 +402,7 @@ impl SdBackend {
         steps_override: Option<u32>,
         gguf_progress: &Arc<Mutex<GgufProgress>>,
     ) -> Result<Vec<u8>, BackendError> {
-        let out_path = std::env::temp_dir().join(format!("aiatm_sd_{}.png", request_id));
+        let out_path = std::env::temp_dir().join(format!("dispos_sd_{}.png", request_id));
         let total_steps = params.steps.or(steps_override).unwrap_or(20);
         let cfg_scale = params.cfg_scale.or(cfg_scale_override).unwrap_or(7.0);
 
@@ -761,7 +761,7 @@ impl InferenceBackend for SdBackend {
                 }
                 None => {
                     warn!(
-                        "sd.exe binary not found (set AIATM_SD_BINARY or place it under \
+                        "sd.exe binary not found (set DISPOS_SD_BINARY or place it under \
                          ~/.lmstudio/extensions/backends/); falling back to simulation mode."
                     );
                 }

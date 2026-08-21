@@ -1,7 +1,7 @@
 {
-  "name": "aiatm-sdk",
+  "name": "dispos-sdk",
   "version": "0.1.0",
-  "description": "TypeScript/JavaScript Client SDK for AIATM Local Inference Daemon",
+  "description": "TypeScript/JavaScript Client SDK for DisposAI Local Inference Daemon",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

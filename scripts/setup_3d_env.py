@@ -14,8 +14,8 @@ Usage:
     python scripts/setup_3d_env.py
 
 Env vars (all optional):
-    AIATM_3D_TORCH   torch version to install (default "2.5.1")
-    AIATM_3D_CUDA    CUDA wheel tag from https://download.pytorch.org/whl/
+    DISPOS_3D_TORCH  torch version to install (default "2.6.0")
+    DISPOS_3D_CUDA   CUDA wheel tag from https://download.pytorch.org/whl/
                       (default "cu124")
 
 Each install stage is wrapped in its own try/except so one failure (e.g. a
@@ -26,7 +26,7 @@ final per-architecture READY/FAILED report, is printed at the end.
 After running, point the daemon at this venv automatically (it's discovered
 by `crates/backends/mesh-backend/src/lib.rs`'s `resolve_3d_python()` at
 `.venv-3d/Scripts/python.exe` / `.venv-3d/bin/python`), or override with the
-`AIATM_3D_PYTHON` env var to use an existing Python 3.11 elsewhere.
+`DISPOS_3D_PYTHON` env var to use an existing Python 3.11 elsewhere.
 """
 
 import os
@@ -42,8 +42,8 @@ VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/pyth
 # torch >= 2.6 is required: diffusers refuses to load pickle (.bin) checkpoints
 # under older torch due to CVE-2025-32434 (torch.load RCE), and several 3D
 # model repos — openai/shap-e's renderer among them — ship only .bin weights.
-TORCH_VERSION = os.environ.get("AIATM_3D_TORCH", "2.6.0")
-CUDA_TAG = os.environ.get("AIATM_3D_CUDA", "cu124")
+TORCH_VERSION = os.environ.get("DISPOS_3D_TORCH", "2.6.0")
+CUDA_TAG = os.environ.get("DISPOS_3D_CUDA", "cu124")
 TORCH_INDEX_URL = f"https://download.pytorch.org/whl/{CUDA_TAG}"
 
 # Comfy3D's prebuilt-wheels release house native extensions (nvdiffrast,
@@ -114,7 +114,7 @@ def ensure_uv():
         "    pip install uv\n\n"
         "...then re-run this script. Alternatively, if you already have a\n"
         "Python 3.11 environment with the needed packages available, point\n"
-        "the daemon at it directly by setting the AIATM_3D_PYTHON env var to\n"
+        "the daemon at it directly by setting the DISPOS_3D_PYTHON env var to\n"
         "its python.exe/python path, and skip this script entirely."
     )
     sys.exit(1)
@@ -250,7 +250,7 @@ def print_summary():
     print(
         f"\nVenv python: {VENV_PYTHON}\n"
         "The daemon auto-discovers this venv; no further configuration needed\n"
-        "unless you relocate it, in which case set AIATM_3D_PYTHON."
+        "unless you relocate it, in which case set DISPOS_3D_PYTHON."
     )
 
 

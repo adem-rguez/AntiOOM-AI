@@ -281,7 +281,7 @@ function AppInner() {
     {
       id: 'welcome',
       role: 'assistant',
-      content: 'Hello! I am your AIATM Local Inference engine running natively with NVIDIA CUDA GPU acceleration.\n\nEnter your GGUF model path and prompt below to generate real responses at over 140+ tokens/sec!',
+      content: 'Hello! I am your DisposAI Local Inference engine running natively with NVIDIA CUDA GPU acceleration.\n\nEnter your GGUF model path and prompt below to generate real responses at over 140+ tokens/sec!',
       telemetry: null
     }
   ]);
@@ -300,7 +300,7 @@ function AppInner() {
   };
   const [appSettings, setAppSettings] = useState(() => {
     try {
-      const stored = JSON.parse(localStorage.getItem('aiatm.general-settings'));
+      const stored = JSON.parse(localStorage.getItem('dispos.general-settings'));
       return stored ? { ...defaultAppSettings, ...stored } : defaultAppSettings;
     } catch {
       return defaultAppSettings;
@@ -308,7 +308,7 @@ function AppInner() {
   });
 
   useEffect(() => {
-    localStorage.setItem('aiatm.general-settings', JSON.stringify(appSettings));
+    localStorage.setItem('dispos.general-settings', JSON.stringify(appSettings));
   }, [appSettings]);
 
   // Sync saved media retention preference to daemon on startup (daemon defaults to 30min otherwise).
@@ -361,7 +361,7 @@ function AppInner() {
   const mesh3dMultiImageInputRef = useRef(null);
 
   // Voice Studio State
-  const [ttsInput, setTtsInput] = useState('Welcome to AIATM Standalone Desktop Application.');
+  const [ttsInput, setTtsInput] = useState('Welcome to Dispos Studio.');
   const [ttsSpeed, setTtsSpeed] = useState(1.0);
   const [audioSrc, setAudioSrc] = useState(null);
   const [isGeneratingTts, setIsGeneratingTts] = useState(false);
@@ -378,7 +378,7 @@ function AppInner() {
   const [openStudios, setOpenStudios] = useState([]); // { modelId, name, modality }
   const [chatSessions, setChatSessions] = useState(() => {
     try {
-      const stored = JSON.parse(localStorage.getItem('aiatm.chat-sessions'));
+      const stored = JSON.parse(localStorage.getItem('dispos.chat-sessions'));
       if (!Array.isArray(stored)) return [];
       // One-time migration: stamp studioKey on legacy sessions that predate
       // canonical keying. Older items lack modelPath; fall back to modelName.
@@ -395,14 +395,14 @@ function AppInner() {
         return { ...item, modelName, studioKey };
       });
       if (migrated) {
-        try { localStorage.setItem('aiatm.chat-sessions', JSON.stringify(result)); } catch {}
+        try { localStorage.setItem('dispos.chat-sessions', JSON.stringify(result)); } catch {}
       }
       return result;
     } catch { return []; }
   });
   const [activeChatId, setActiveChatId] = useState(null);
   const [collapsedStudios, setCollapsedStudios] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('aiatm.studio-collapsed')) ?? {}; } catch { return {}; }
+    try { return JSON.parse(localStorage.getItem('dispos.studio-collapsed')) ?? {}; } catch { return {}; }
   });
   const [editingSessionId, setEditingSessionId] = useState(null);
   const [editValue, setEditValue] = useState('');
@@ -511,7 +511,7 @@ function AppInner() {
   const [modelFitPreview, setModelFitPreview] = useState(null);
   const [detectedModels, setDetectedModels] = useState([]);
   const [modelCards, setModelCards] = useState(() => {
-    const saved = localStorage.getItem('antioom-model-cards');
+    const saved = localStorage.getItem('dispos-model-cards');
     return saved ? JSON.parse(saved) : [];
   });
   const [showModelPicker, setShowModelPicker] = useState(false);
@@ -806,7 +806,7 @@ function AppInner() {
   }, [hfDownloads, fetchCatalog]);
 
   useEffect(() => {
-    localStorage.setItem('antioom-model-cards', JSON.stringify(modelCards));
+    localStorage.setItem('dispos-model-cards', JSON.stringify(modelCards));
   }, [modelCards]);
 
   useEffect(() => {
@@ -818,11 +818,11 @@ function AppInner() {
   }, [modelCards]);
 
   useEffect(() => {
-    localStorage.setItem('aiatm.chat-sessions', JSON.stringify(chatSessions));
+    localStorage.setItem('dispos.chat-sessions', JSON.stringify(chatSessions));
   }, [chatSessions]);
 
   useEffect(() => {
-    localStorage.setItem('aiatm.studio-collapsed', JSON.stringify(collapsedStudios));
+    localStorage.setItem('dispos.studio-collapsed', JSON.stringify(collapsedStudios));
   }, [collapsedStudios]);
 
   // Model preset catalog
@@ -1580,7 +1580,7 @@ function AppInner() {
       <header className="desktop-header">
         <div className="logo-group">
           <div className="logo-icon">AI</div>
-          <div className="logo-title">AIATM Desktop</div>
+          <div className="logo-title">Dispos Studio</div>
           <span className="version-tag">Standalone Native</span>
         </div>
 
@@ -2143,7 +2143,7 @@ function AppInner() {
                           handleSendMessage();
                         }
                       }}
-                      placeholder={acceptsImageInput ? 'Ask about an image or type a message...' : modelStatus.is_loaded ? 'Ask AntiOOM AI anything...' : 'Load a model to start chatting...'}
+                      placeholder={acceptsImageInput ? 'Ask about an image or type a message...' : modelStatus.is_loaded ? 'Ask DisposAI anything...' : 'Load a model to start chatting...'}
                     />
                     <button className="btn-send" onClick={handleSendMessage} disabled={isGenerating}>
                       <Send size={18} />
@@ -2272,7 +2272,7 @@ function AppInner() {
                               </div>
                             </div>
                           ))}
-                        {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in AIATM's models folder.</p>}
+                        {detectedModels.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No models found in DisposAI's models folder.</p>}
                       </div>
                     </>
                   )}
@@ -2670,7 +2670,7 @@ function AppInner() {
             <div className="tab-panel">
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>General Settings</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-                Preferences for this local AIATM desktop app. Changes are saved on this device.
+                Preferences for this local Dispos Studio app. Changes are saved on this device.
               </p>
               <div className="card" style={{ maxWidth: '680px' }}>
                 <div className="slider-header" style={{ padding: '0.8rem 0', borderBottom: '1px solid var(--border-color)' }}>
@@ -2678,7 +2678,7 @@ function AppInner() {
                   <input type="checkbox" checked={appSettings.autoSelectNewest} onChange={e => setAppSettings(current => ({ ...current, autoSelectNewest: e.target.checked }))} />
                 </div>
                 <div style={{ padding: '1rem 0', borderBottom: '1px solid var(--border-color)' }}>
-                  <div className="slider-header"><div><strong>Model status refresh</strong><div className="slider-hint">How often AIATM checks loaded models.</div></div><span className="badge-value">{appSettings.refreshSeconds}s</span></div>
+                  <div className="slider-header"><div><strong>Model status refresh</strong><div className="slider-hint">How often Dispos Studio checks loaded models.</div></div><span className="badge-value">{appSettings.refreshSeconds}s</span></div>
                   <input className="control-slider" type="range" min="1" max="10" step="1" value={appSettings.refreshSeconds} onChange={e => setAppSettings(current => ({ ...current, refreshSeconds: Number(e.target.value) }))} />
                 </div>
                 <div className="slider-header" style={{ padding: '1rem 0', borderBottom: '1px solid var(--border-color)' }}>

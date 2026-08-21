@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    info!("Starting AIATM Local Inference Daemon v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting DisposAI Local Inference Daemon v{}", env!("CARGO_PKG_VERSION"));
 
     // 0. Child-process tracker — shared by the legacy backend and the
     //    HTTP `/v1/model/load` path so spawned llama-server.exe processes

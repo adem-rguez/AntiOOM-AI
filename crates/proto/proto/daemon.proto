@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package aiatm.daemon.v1;
+package dispos.daemon.v1;
 
 enum Modality {
   MODALITY_UNSPECIFIED = 0;

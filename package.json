@@ -1,6 +1,11 @@
 {
+  "name": "dispos-ai",
   "private": true,
+  "workspaces": [
+    "apps/dispos-studio",
+    "sdk/typescript"
+  ],
   "scripts": {
-    "start": "npm run start --prefix apps/aiatm-desktop"
+    "start": "npm run start --prefix apps/dispos-studio"
   }
 }

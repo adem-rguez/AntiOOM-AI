@@ -1,15 +1,15 @@
 import sys
 import os
 
-# Add sdk/python to path for testing
+# Add sdk/python to path for testing (dispos_sdk module)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sdk", "python")))
 
-from aiatm_sdk import AIATMClient
+from dispos_sdk import DisposClient
 
 def main():
-    client = AIATMClient("http://localhost:8080")
+    client = DisposClient("http://localhost:8080")
     
-    print("Testing AIATM Python SDK...")
+    print("Testing DisposAI Python SDK...")
     health = client.health()
     print(f"Health: {health}")
     
@@ -22,7 +22,7 @@ def main():
     
     chat = client.chat_completion(
         model="models/Qwen3.5-0.8B-Q8_0.gguf",
-        messages=[{"role": "user", "content": "Hello AIATM!"}]
+        messages=[{"role": "user", "content": "Hello DisposAI!"}]
     )
     print(f"Completion Response: {chat['choices'][0]['message']['content']}")
 

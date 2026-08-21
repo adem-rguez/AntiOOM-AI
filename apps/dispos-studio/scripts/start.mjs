@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AIATM Desktop Launcher
+ * Dispos Studio Launcher
  * Builds the React app, then loads it via file:// protocol.
  * Watches for file changes and rebuilds automatically.
  */
@@ -16,7 +16,7 @@ const projectRoot = join(root, '..', '..');
 const distIndex = join(root, 'dist', 'index.html');
 const electronBin = join(root, 'node_modules', 'electron', 'dist', 'electron.exe');
 const viteBin = join(root, 'node_modules', '.bin', 'vite.cmd');
-const daemonBin = process.env.ANTIOOM_DAEMON_PATH || join(projectRoot, 'target', 'release', 'daemon-core.exe');
+const daemonBin = process.env.DISPOS_DAEMON_PATH || join(projectRoot, 'target', 'release', 'daemon-core.exe');
 const modelsDir = join(projectRoot, 'models');
 
 function daemonIsReady() {
@@ -36,13 +36,13 @@ async function ensureDaemon() {
     return null;
   }
   if (!existsSync(daemonBin)) {
-    throw new Error(`daemon-core not found at ${daemonBin}. Set ANTIOOM_DAEMON_PATH or build the daemon first.`);
+    throw new Error(`daemon-core not found at ${daemonBin}. Set DISPOS_DAEMON_PATH or build the daemon first.`);
   }
   console.log('[LAUNCHER] Starting local daemon...');
   const daemon = spawn(daemonBin, [], {
     cwd: projectRoot,
     stdio: 'inherit',
-    env: { ...process.env, AIATM_MODELS_DIR: modelsDir },
+    env: { ...process.env, DISPOS_MODELS_DIR: modelsDir },
   });
   for (let attempt = 0; attempt < 60; attempt += 1) {
     if (await daemonIsReady()) {
@@ -109,7 +109,7 @@ console.log('[LAUNCHER] Launching Electron window...');
 const electron = spawn(electronBin, ['electron-main.js'], {
   cwd: root,
   stdio: 'inherit',
-  env: { ...process.env, AIATM_DIST_PATH: distIndex },
+  env: { ...process.env, DISPOS_DIST_PATH: distIndex },
 });
 
 // --- Watch for source changes and rebuild ---

@@ -37,7 +37,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 /// Minimal valid ASCII OBJ unit cube, used as the simulation-mode fallback
 /// mesh when no `threed_server.py` process is running.
 const SIMULATION_CUBE_OBJ: &str = "\
-# AntiOOM AI simulation-mode placeholder mesh
+# DisposAI simulation-mode placeholder mesh
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
 v 1.0 1.0 0.0
@@ -79,12 +79,12 @@ impl MeshBackend {
     /// preferring the project-local `.venv-3d` environment (built by
     /// `scripts/setup_3d_env.py`) that houses the heavy 3D-model deps system
     /// Python can't build. Resolution order:
-    ///   1. `AIATM_3D_PYTHON` env var, if it points at an existing file.
+    ///   1. `DISPOS_3D_PYTHON` env var, if it points at an existing file.
     ///   2. `.venv-3d/Scripts/python.exe` (Windows) / `.venv-3d/bin/python`
     ///      (unix), relative to the current working directory.
     ///   3. Fallback to `"python"` on PATH.
     fn resolve_3d_python() -> PathBuf {
-        if let Ok(custom) = std::env::var("AIATM_3D_PYTHON") {
+        if let Ok(custom) = std::env::var("DISPOS_3D_PYTHON") {
             let path = PathBuf::from(custom);
             if path.exists() {
                 return path;

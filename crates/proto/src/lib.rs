@@ -1,1 +1,1 @@
-tonic::include_proto!("aiatm.daemon.v1");
+tonic::include_proto!("dispos.daemon.v1");

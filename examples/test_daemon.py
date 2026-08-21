@@ -3,9 +3,9 @@ import json
 
 BASE_URL = "http://localhost:8080"
 
-def test_aiatm_daemon():
+def test_dispos_daemon():
     print("==================================================")
-    print("⚡ TESTING AIATM LOCAL INFERENCE DAEMON ⚡")
+    print("⚡ TESTING DISPOSAI LOCAL INFERENCE DAEMON ⚡")
     print("==================================================")
 
     # 1. Health Check
@@ -69,4 +69,4 @@ def test_aiatm_daemon():
     print("==================================================")
 
 if __name__ == "__main__":
-    test_aiatm_daemon()
+    test_dispos_daemon()
