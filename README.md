@@ -20,9 +20,11 @@
 
 ## 🚀 Why DisposAI?
 
+The name **Dispos** comes from the Latin word *dispositor* (from *disponere*), which means *"arranger"* or *"one who sets things in order"*—reflecting how the system orchestrates and manages your suite of local models.
+
 Running local AI today is fragmented and prone to out-of-memory crashes (**OOM**). Users juggle multiple heavy tools—one for LLMs, one for Stable Diffusion, another for 3D generation, and separate scripts for TTS—often crashing when VRAM allocations collide.
 
-**DisposAI** (from Latin *Dispositor*, "The Strategic Arranger") puts your entire local model suite **at your disposal**. Powered by a **resident Rust daemon** that arbitrates GPU VRAM and CPU memory across all modalities, DisposAI unifies text reasoning, vision understanding, 3D mesh generation, image synthesis, voice synthesis, and transcription under **one protocol, one memory arbiter, one dashboard, and one desktop studio**.
+DisposAI unifies text reasoning, vision understanding, 3D mesh generation, image synthesis, voice synthesis, and transcription under **one protocol, one memory arbiter, one dashboard, and one desktop studio**.
 
 ---
 
@@ -362,3 +364,12 @@ This project is dual-licensed under either:
 - **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 
 at your option.
+
+---
+
+## ☕ Support
+
+If you find DisposAI useful, consider buying me a coffee to support continued development:
+
+<a href="https://buymeacoffee.com/adem.rguez" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50" style="border-radius: 8px;"></a>
+
