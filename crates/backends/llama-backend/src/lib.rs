@@ -17,6 +17,21 @@ use process_tracker::ChildRegistry;
 /// Legacy / single-model slot in the global child tracker.
 const LEGACY_KEY: &str = "legacy";
 
+/// Resolves once `cancel`'s flag is set (polled every 150ms), or never
+/// resolves when `cancel` is `None`. Raced via `tokio::select!` against an
+/// in-flight request future so a caller-set cancel flag can abort it.
+async fn wait_cancelled(cancel: Option<&Arc<AtomicBool>>) {
+    match cancel {
+        None => std::future::pending::<()>().await,
+        Some(flag) => loop {
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        },
+    }
+}
+
 pub struct LlamaBackend {
     model_path: Option<PathBuf>,
     is_loaded: Arc<AtomicBool>,
@@ -259,7 +274,10 @@ impl InferenceBackend for LlamaBackend {
             });
 
             let url = format!("http://127.0.0.1:{}/v1/chat/completions", self.server_port);
-            let res = client.post(&url).json(&payload).send().await;
+            let res = tokio::select! {
+                r = client.post(&url).json(&payload).send() => r,
+                _ = wait_cancelled(request.cancel.as_ref()) => return Err(BackendError::Cancelled),
+            };
 
             match res {
                 Ok(response) => {
@@ -312,7 +330,10 @@ impl InferenceBackend for LlamaBackend {
             });
 
             let url = format!("http://127.0.0.1:{}/completion", self.server_port);
-            let res = client.post(&url).json(&payload).send().await;
+            let res = tokio::select! {
+                r = client.post(&url).json(&payload).send() => r,
+                _ = wait_cancelled(request.cancel.as_ref()) => return Err(BackendError::Cancelled),
+            };
 
             match res {
                 Ok(response) => {

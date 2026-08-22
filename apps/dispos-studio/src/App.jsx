@@ -97,6 +97,46 @@ function ThinkingBlock({ thinkText, hadThinkTag }) {
   );
 }
 
+// A single "Used tool: X" chip. Expands (same accordion pattern as
+// ThinkingBlock) to show the request details for that specific call —
+// model name and full arguments, when the backend has sent them.
+function ToolCallChip({ event, onCancel }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const modelName = event.arguments?.model;
+  const label = event.status === 'executing' ? `Calling ${event.name}...`
+    : event.status === 'done' ? `Used tool: ${event.name}${modelName ? ` (${modelName})` : ''}`
+    : event.status === 'error' ? `Tool ${event.name} failed: ${event.detail}`
+    : event.status === 'cancelled' ? `Generation cancelled: ${event.name}`
+    : '';
+
+  return (
+    <div className={`tool-status-indicator ${event.status}`} style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <button className="thinking-header" style={{ padding: 0, background: 'transparent', color: 'inherit', flex: 1 }} onClick={() => setIsOpen(!isOpen)}>
+          <div className="thinking-title">
+            {event.status === 'executing' && <Loader size={14} className="spin" />}
+            <span>{label}</span>
+          </div>
+          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </button>
+        {event.status === 'executing' && event.jobId && (
+          <button className="tool-status-cancel-btn" onClick={onCancel}>
+            Cancel
+          </button>
+        )}
+      </div>
+      {event.progress && <GenProgressBar progress={event.progress} />}
+      {isOpen && (
+        <div className="thinking-content">
+          {event.arguments
+            ? JSON.stringify(event.arguments, null, 2)
+            : 'No request details available for this call (the daemon does not currently send tool call arguments to the UI).'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Generation progress bar, shared by the image/mesh/tts studios. `progress` is
 // a GenerationProgress record (see /v1/jobs/:id/progress) or null when idle.
 function GenProgressBar({ progress }) {
@@ -136,6 +176,44 @@ function canonicalStudioKey(modelPath, modelName) {
   const stripped = basename.replace(/\.(gguf|safetensors|onnx|bin|ckpt)$/i, '');
   const cleaned = stripped.toLowerCase().replace(/\s+/g, '-').trim();
   return cleaned || raw;
+}
+
+// Mirrors `select_adapter()` / `ADAPTER_REGISTRY` in scripts/threed_server.py:
+// same match-token precedence (first match wins, "cube-placeholder" is the
+// fallback), kept in sync manually since the Python side is the source of
+// truth for which adapter actually loads. Used to key into the per-adapter
+// param schema from `GET /v1/models3d/schema`.
+const MESH3D_ADAPTER_MATCH_ORDER = [
+  { id: 'llama-mesh', tokens: ['llama-mesh', 'llama_mesh', 'llamamesh'] },
+  { id: 'point-e', tokens: ['point-e', 'point_e', 'pointe'] },
+  { id: 'shap-e', tokens: ['shap-e', 'shap_e', 'shape'] },
+  { id: 'triposr', tokens: ['triposr', 'tripo'] },
+  { id: 'stable-fast-3d', tokens: ['sf3d', 'stable-fast-3d', 'stable_fast_3d'] },
+  { id: 'cube-placeholder', tokens: ['instantmesh', 'instant-mesh', 'instant_mesh'] },
+  { id: 'trellis', tokens: ['trellis'] },
+  { id: 'hunyuan3d', tokens: ['hunyuan3d', 'hunyuan-3d', 'hunyuan_3d'] },
+  { id: 'cube-placeholder', tokens: ['wonder3d', 'sv3d', 'zero123', 'zero-1-2-3'] },
+  { id: 'cube-placeholder', tokens: ['crm', 'lgm'] },
+];
+
+function detectMesh3dAdapterId(modelPath) {
+  if (!modelPath) return 'cube-placeholder';
+  const parts = modelPath.replace(/\\/g, '/').split('/').filter(Boolean);
+  const combined = `${parts[parts.length - 2] || ''} ${parts[parts.length - 1] || ''}`.toLowerCase();
+  const match = MESH3D_ADAPTER_MATCH_ORDER.find(({ tokens }) => tokens.some(token => combined.includes(token)));
+  return match ? match.id : 'cube-placeholder';
+}
+
+// Initial control value for a schema param. Respects `default` when present;
+// a null/undefined default (e.g. shap-e's `seed`) is left as `null` for
+// numeric types so it's sent through as-is and the backend's own PARAM_SPEC
+// default applies (see `resolve_params()` in scripts/threed_server.py).
+function meshParamDefaultValue(p) {
+  if (p.default !== null && p.default !== undefined) return p.default;
+  if (p.type === 'bool') return false;
+  if (p.type === 'str') return '';
+  if (p.type === 'enum') return p.choices?.[0] ?? '';
+  return null;
 }
 
 function AttachmentPreview({ attachment }) {
@@ -344,19 +422,22 @@ function AppInner() {
   const [imgSrc, setImgSrc] = useState(null);
   const [isGeneratingImg, setIsGeneratingImg] = useState(false);
   const [imgProgress, setImgProgress] = useState(null);
+  const [imgMissingComponents, setImgMissingComponents] = useState(null);
+  const [activeImageJobId, setActiveImageJobId] = useState(null);
 
   // 3D Model Studio State
   const [mesh3dPrompt, setMesh3dPrompt] = useState('A low-poly wooden treasure chest, game-ready asset');
   const [mesh3dImages, setMesh3dImages] = useState([]); // [{name, dataUrl}]
   const [mesh3dInputKind, setMesh3dInputKind] = useState('text');
-  const [mesh3dSteps, setMesh3dSteps] = useState(64);
-  const [mesh3dGuidance, setMesh3dGuidance] = useState(15);
-  const [mesh3dSeed, setMesh3dSeed] = useState(-1);
+  const [mesh3dSchema, setMesh3dSchema] = useState(null); // { <adapterId>: { params: [...] } }, null if unavailable
+  const [mesh3dCfgOverrides, setMesh3dCfgOverrides] = useState({}); // saved per-model defaults, keyed by param name
+  const [mesh3dParamValues, setMesh3dParamValues] = useState({}); // current values of the dynamic schema-driven params
   const [mesh3dFormat, setMesh3dFormat] = useState('glb');
   const [mesh3dTexture, setMesh3dTexture] = useState(true);
   const [mesh3dResult, setMesh3dResult] = useState(null); // {base64, format}
   const [isGeneratingMesh, setIsGeneratingMesh] = useState(false);
   const [meshProgress, setMeshProgress] = useState(null);
+  const [activeMeshJobId, setActiveMeshJobId] = useState(null);
   const mesh3dImageInputRef = useRef(null);
   const mesh3dMultiImageInputRef = useRef(null);
 
@@ -366,6 +447,7 @@ function AppInner() {
   const [audioSrc, setAudioSrc] = useState(null);
   const [isGeneratingTts, setIsGeneratingTts] = useState(false);
   const [ttsProgress, setTtsProgress] = useState(null);
+  const [activeTtsJobId, setActiveTtsJobId] = useState(null);
 
   // Default values used by the fit preview and new model configuration.
   const [gpuLayers, setGpuLayers] = useState(99);
@@ -682,12 +764,17 @@ function AppInner() {
       .finally(() => setHfRepoFilesLoading(false));
   };
 
-  const startHfDownload = (repoId, filename) => {
+  const startHfDownload = (repoId, filename, targetDir, targetFilename) => {
     setHfDownloads(current => ({ ...current, [filename]: { status: 'downloading', downloaded_bytes: 0, total_bytes: 0 } }));
     fetch('http://127.0.0.1:8080/v1/model/hf-download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repo: repoId, filename }),
+      body: JSON.stringify({
+        repo: repoId,
+        filename,
+        ...(targetDir ? { target_dir: targetDir } : {}),
+        ...(targetFilename ? { target_filename: targetFilename } : {}),
+      }),
     }).catch(() => {
       setHfDownloads(current => ({ ...current, [filename]: { ...current[filename], status: 'error' } }));
     });
@@ -804,6 +891,21 @@ function AppInner() {
     }, 2000);
     return () => clearInterval(interval);
   }, [hfDownloads, fetchCatalog]);
+
+  // Auto-retry image generation once every downloadable missing component
+  // finishes downloading. Clearing imgMissingComponents here (rather than
+  // inside handleGenerateImage before this effect re-runs) is what prevents
+  // an infinite retry loop if the retry fails again.
+  useEffect(() => {
+    if (!imgMissingComponents || imgMissingComponents.length === 0) return;
+    const downloadable = imgMissingComponents.filter(c => c.source);
+    if (downloadable.length === 0) return;
+    const allDone = downloadable.every(c => hfDownloads[c.source.filename]?.status === 'complete');
+    if (allDone) {
+      setImgMissingComponents(null);
+      handleGenerateImage();
+    }
+  }, [hfDownloads, imgMissingComponents]);
 
   useEffect(() => {
     localStorage.setItem('dispos-model-cards', JSON.stringify(modelCards));
@@ -938,9 +1040,10 @@ function AppInner() {
         setTtsSpeed(cfg.speed ?? 1.0);
         break;
       case 'mesh3d':
-        setMesh3dSteps(cfg.steps ?? 64);
-        setMesh3dGuidance(cfg.guidance_scale ?? 15);
-        setMesh3dSeed(cfg.seed ?? -1);
+        // These are the only param names the "Configure Model" sidebar saves;
+        // they're applied as overrides on top of the schema's own defaults
+        // only for adapters whose dynamic params actually use these names.
+        setMesh3dCfgOverrides({ steps: cfg.steps ?? 64, guidance_scale: cfg.guidance_scale ?? 15, seed: cfg.seed ?? -1 });
         setMesh3dTexture(cfg.texture ?? true);
         break;
       default:
@@ -1063,6 +1166,38 @@ function AppInner() {
   useEffect(() => {
     if (!mesh3dAvailableKinds.includes(mesh3dInputKind)) setMesh3dInputKind(mesh3dAvailableKinds[0]);
   }, [mesh3dAvailableKinds.join(','), mesh3dInputKind]);
+
+  // Per-adapter param schema, fetched so the mesh3d panel can render its
+  // tunable params generically instead of hardcoding fields per model.
+  // Re-fetched whenever the active mesh3d model changes (not just once on
+  // app mount) because the daemon's schema endpoint 503s until a mesh3d
+  // model's threed_server.py subprocess is actually running — mounting is
+  // almost always before any 3D model has been loaded.
+  useEffect(() => {
+    fetch('http://127.0.0.1:8080/v1/models3d/schema')
+      .then(res => (res.ok ? res.json() : Promise.reject(new Error('schema fetch failed'))))
+      .then(schema => setMesh3dSchema(schema))
+      .catch(() => setMesh3dSchema(null));
+  }, [activeMesh3dLoaded?.model_path, activeMesh3dCatalog?.path]);
+  const mesh3dAdapterId = detectMesh3dAdapterId(activeMesh3dLoaded?.model_path || activeMesh3dCatalog?.path);
+  const mesh3dAdapterParams = mesh3dSchema?.[mesh3dAdapterId]?.params || [];
+  // Re-seed the dynamic param values whenever the active adapter (or the
+  // schema itself) changes, applying any saved per-model overrides first.
+  useEffect(() => {
+    const defaults = {};
+    mesh3dAdapterParams.forEach(p => {
+      defaults[p.name] = mesh3dCfgOverrides[p.name] ?? meshParamDefaultValue(p);
+    });
+    setMesh3dParamValues(defaults);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mesh3dAdapterId, mesh3dSchema, mesh3dCfgOverrides]);
+  const setMesh3dParam = (name, value) => setMesh3dParamValues(current => ({ ...current, [name]: value }));
+  // Which required field (if any) is currently unfilled for the selected input
+  // kind — mirrors the backend's run_model requirement: prompt for "text",
+  // an image for "image"/"multi_image". Null means the form is ready to submit.
+  const mesh3dMissingField = mesh3dInputKind === 'text'
+    ? (!mesh3dPrompt.trim() ? 'prompt' : null)
+    : (mesh3dImages.length === 0 ? 'image' : null);
   const startStudio = (loadedEntry, catalogModel) => {
     const modality = catalogModel?.modality ?? loadedEntry?.modality ?? 'text';
     const modelName = catalogModel?.name ?? loadedEntry.model_path?.split('\\').pop() ?? 'Local model';
@@ -1253,7 +1388,7 @@ function AppInner() {
               const jobId = chunk.job_id || null;
               syncMessages(prev => prev.map(m =>
                 m.id === aiId
-                  ? { ...m, toolEvents: [...(m.toolEvents || []), { name: chunk.tool_name, status: 'executing', jobId, progress: null }] }
+                  ? { ...m, toolEvents: [...(m.toolEvents || []), { name: chunk.tool_name, status: 'executing', jobId, progress: null, arguments: chunk.arguments || null }] }
                   : m
               ));
               if (jobId) {
@@ -1264,10 +1399,12 @@ function AppInner() {
                       if (!record) return;
                       syncMessages(prev => prev.map(m => {
                         if (m.id !== aiId) return m;
-                        const events = (m.toolEvents || []).map(e => (e.jobId === jobId ? { ...e, progress: record } : e));
+                        const events = (m.toolEvents || []).map(e => (e.jobId === jobId
+                          ? { ...e, progress: record, status: record.status === 'cancelled' ? 'cancelled' : e.status }
+                          : e));
                         return { ...m, toolEvents: events };
                       }));
-                      if (record.status === 'done' || record.status === 'error') stopJobPolling(jobId);
+                      if (record.status === 'done' || record.status === 'error' || record.status === 'cancelled') stopJobPolling(jobId);
                     })
                     .catch(() => {});
                 }, 200);
@@ -1297,16 +1434,12 @@ function AppInner() {
                   detail: chunk.is_error ? chunk.content : null,
                   jobId: chunk.job_id || null,
                   progress: null,
+                  media: mediaResult,
+                  arguments: chunk.arguments || (idx >= 0 ? events[idx].arguments : null) || null,
                 };
                 if (idx >= 0) events[idx] = resolved; else events.push(resolved);
 
-                return {
-                  ...m,
-                  toolEvents: events,
-                  mediaResults: mediaResult
-                    ? [...(m.mediaResults || []), mediaResult]
-                    : m.mediaResults,
-                };
+                return { ...m, toolEvents: events };
               }));
               continue;
             }
@@ -1418,11 +1551,22 @@ function AppInner() {
     setAttachments(current => [...current, ...accepted]);
   };
 
+  // POSTs a cancel request for an in-flight job. The backend flags the job;
+  // the existing progress poll picks up status "cancelled" once it notices.
+  const cancelGenerationJob = (jobId) => {
+    if (!jobId) return;
+    fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/cancel`, { method: 'POST' }).catch(() => {});
+  };
+
   // Fires a generation request while polling GET /v1/jobs/:id/progress every
   // ~200ms on a separate timer (no await in between), so the progress bar
-  // updates concurrently with the non-streaming generation fetch.
-  const runGenerationJob = async (url, body, setProgress) => {
+  // updates concurrently with the non-streaming generation fetch. `setJobId`
+  // (optional) exposes the generated job id to the caller for the duration of
+  // the job, e.g. so a Cancel button can target it.
+  const runGenerationJob = async (url, body, setProgress, setJobId) => {
     const jobId = crypto.randomUUID();
+    if (setJobId) setJobId(jobId);
+    let cancelled = false;
     const fetchPromise = fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1431,7 +1575,11 @@ function AppInner() {
     const interval = setInterval(() => {
       fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/progress`)
         .then(res => (res.ok ? res.json() : null))
-        .then(record => { if (record) setProgress(record); })
+        .then(record => {
+          if (!record) return;
+          setProgress(record);
+          if (record.status === 'cancelled') cancelled = true;
+        })
         .catch(() => {});
     }, 200);
     try {
@@ -1439,23 +1587,35 @@ function AppInner() {
       if (!res.ok) {
         const text = (await res.text()).trim();
         let message = text;
+        let missingComponents = null;
         try {
           const parsed = JSON.parse(text);
           message = parsed?.error || parsed?.message || text;
+          if (Array.isArray(parsed?.missing_components) && parsed.missing_components.length > 0) {
+            missingComponents = parsed.missing_components;
+          }
         } catch {
           // plain-text error body, use as-is
         }
-        throw new Error(message);
+        const err = new Error(cancelled ? 'Generation cancelled' : message);
+        err.cancelled = cancelled;
+        if (missingComponents) err.missingComponents = missingComponents;
+        throw err;
       }
       return await res.json();
+    } catch (e) {
+      if (cancelled) e.cancelled = true;
+      throw e;
     } finally {
       clearInterval(interval);
       setProgress(null);
+      if (setJobId) setJobId(null);
     }
   };
 
   const handleGenerateImage = async () => {
     setIsGeneratingImg(true);
+    setImgMissingComponents(null);
     try {
       const data = await runGenerationJob('http://127.0.0.1:8080/v1/images/generations', {
         prompt: imgPrompt,
@@ -1465,12 +1625,20 @@ function AppInner() {
         width: Number(imgWidth),
         height: Number(imgHeight),
         seed: Number(imgSeed),
-      }, setImgProgress);
+      }, setImgProgress, setActiveImageJobId);
       if (data?.data?.[0]?.b64_json) {
         setImgSrc('data:image/png;base64,' + data.data[0].b64_json);
+        setImgMissingComponents(null);
       }
     } catch (e) {
-      pushError('Image generation error: ' + e);
+      if (e.cancelled) {
+        pushError('Generation cancelled', 'info');
+      } else {
+        if (Array.isArray(e.missingComponents) && e.missingComponents.length > 0) {
+          setImgMissingComponents(e.missingComponents);
+        }
+        pushError('Image generation error: ' + e);
+      }
     } finally {
       setIsGeneratingImg(false);
     }
@@ -1522,21 +1690,23 @@ function AppInner() {
       const body = {
         prompt: mesh3dPrompt,
         input_kind: mesh3dInputKind,
-        steps: Number(mesh3dSteps),
-        guidance_scale: Number(mesh3dGuidance),
-        seed: Number(mesh3dSeed),
         output_format: mesh3dFormat,
         texture: mesh3dTexture,
+        ...mesh3dParamValues,
       };
       if (mesh3dInputKind !== 'text') {
         body.images = mesh3dImages.map(img => img.dataUrl.split(',')[1]);
       }
-      const data = await runGenerationJob('http://127.0.0.1:8080/v1/models3d/generations', body, setMeshProgress);
+      const data = await runGenerationJob('http://127.0.0.1:8080/v1/models3d/generations', body, setMeshProgress, setActiveMeshJobId);
       if (data?.mesh_base64) {
         setMesh3dResult({ base64: data.mesh_base64, format: data.format || mesh3dFormat });
       }
     } catch (e) {
-      pushError('3D mesh generation error: ' + e);
+      if (e.cancelled) {
+        pushError('Generation cancelled', 'info');
+      } else {
+        pushError('3D mesh generation error: ' + e);
+      }
     } finally {
       setIsGeneratingMesh(false);
     }
@@ -1547,12 +1717,16 @@ function AppInner() {
     try {
       const data = await runGenerationJob('http://127.0.0.1:8080/v1/audio/speech', {
         model: 'kokoro', input: ttsInput, speed: Number(ttsSpeed),
-      }, setTtsProgress);
+      }, setTtsProgress, setActiveTtsJobId);
       if (data?.audio_b64) {
         setAudioSrc('data:audio/wav;base64,' + data.audio_b64);
       }
     } catch (e) {
-      pushError('TTS error: ' + e);
+      if (e.cancelled) {
+        pushError('Generation cancelled', 'info');
+      } else {
+        pushError('TTS error: ' + e);
+      }
     } finally {
       setIsGeneratingTts(false);
     }
@@ -2058,41 +2232,32 @@ function AppInner() {
                           {msg.attachments.map(attachment => <AttachmentPreview key={attachment.dataUrl} attachment={attachment} />)}
                         </div>}
                         {msg.toolEvents?.map((event, idx) => (
-                          <div key={idx} className={`tool-status-indicator ${event.status}`}>
-                            {event.status === 'executing' && <Loader size={14} className="spin" />}
-                            <span>
-                              {event.status === 'executing' && `Calling ${event.name}...`}
-                              {event.status === 'done' && `Used tool: ${event.name}`}
-                              {event.status === 'error' && `Tool ${event.name} failed: ${event.detail}`}
-                            </span>
-                            {event.progress && <GenProgressBar progress={event.progress} />}
-                          </div>
+                          <React.Fragment key={idx}>
+                            <ToolCallChip event={event} onCancel={() => cancelGenerationJob(event.jobId)} />
+                            {event.media && (
+                              isMeshResource(event.media.type, event.media.url) ? (
+                                <div className="tool-media-result">
+                                  <Mesh3DViewer url={event.media.url} format={guessMeshFormat(event.media.url)} />
+                                </div>
+                              ) : (
+                                <div className="tool-media-result">
+                                  {event.media.type?.startsWith('audio/') && (
+                                    <audio controls autoPlay src={event.media.url} style={{ width: '100%' }} />
+                                  )}
+                                  {event.media.type?.startsWith('image/') && (
+                                    <img src={event.media.url} alt="Generated" className="tool-media-image" />
+                                  )}
+                                  {event.media.type?.startsWith('video/') && (
+                                    <video controls src={event.media.url} style={{ width: '100%', borderRadius: '8px' }} />
+                                  )}
+                                  <button type="button" className="tool-media-download-btn" onClick={() => handleDownloadMedia(event.media.url, event.media.type)} title="Download">
+                                    <Download size={12} /> Download
+                                  </button>
+                                </div>
+                              )
+                            )}
+                          </React.Fragment>
                         ))}
-                        {msg.mediaResults?.map((media, idx) => {
-                          if (isMeshResource(media.type, media.url)) {
-                            return (
-                              <div key={idx} className="tool-media-result">
-                                <Mesh3DViewer url={media.url} format={guessMeshFormat(media.url)} />
-                              </div>
-                            );
-                          }
-                          return (
-                            <div key={idx} className="tool-media-result">
-                              {media.type?.startsWith('audio/') && (
-                                <audio controls autoPlay src={media.url} style={{ width: '100%' }} />
-                              )}
-                              {media.type?.startsWith('image/') && (
-                                <img src={media.url} alt="Generated" className="tool-media-image" />
-                              )}
-                              {media.type?.startsWith('video/') && (
-                                <video controls src={media.url} style={{ width: '100%', borderRadius: '8px' }} />
-                              )}
-                              <button type="button" className="tool-media-download-btn" onClick={() => handleDownloadMedia(media.url, media.type)} title="Download">
-                                <Download size={12} /> Download
-                              </button>
-                            </div>
-                          );
-                        })}
                         {msg.telemetry && (
                           <div className="meta-info">
                             <span className="tag-speed"><Zap size={11} /> {msg.telemetry}</span>
@@ -2812,10 +2977,76 @@ function AppInner() {
                     />
                   </div>
 
-                  <button className="btn-primary" onClick={handleGenerateImage} disabled={isGeneratingImg}>
-                    <Sparkles size={16} /> {isGeneratingImg ? 'Rendering...' : 'Generate Image'}
-                  </button>
+                  <div className="gen-btn-row">
+                    <button className="btn-primary" onClick={handleGenerateImage} disabled={isGeneratingImg}>
+                      <Sparkles size={16} /> {isGeneratingImg ? 'Rendering...' : 'Generate Image'}
+                    </button>
+                    {isGeneratingImg && (
+                      <button className="btn-cancel-gen" onClick={() => cancelGenerationJob(activeImageJobId)}>
+                        <X size={16} /> Cancel
+                      </button>
+                    )}
+                  </div>
                   {isGeneratingImg && <GenProgressBar progress={imgProgress} />}
+
+                  {imgMissingComponents && imgMissingComponents.length > 0 && (
+                    <div className="hf-folder-group" style={{ marginTop: '1rem', border: '1px solid var(--border-color, #333)', borderRadius: 6, padding: '0.75rem' }}>
+                      <div className="hf-folder-header" style={{ paddingLeft: 0 }}>
+                        Missing model components
+                      </div>
+                      {imgMissingComponents.map((comp, idx) => {
+                        const download = comp.source ? hfDownloads[comp.source.filename] : null;
+                        const progressPct = download && download.total_bytes > 0
+                          ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
+                          : 0;
+                        return (
+                          <div key={idx} className="hf-file-row" style={{ paddingLeft: 0 }}>
+                            <div className="hf-file-info">
+                              <div className="hf-file-name-row">
+                                <span className="hf-file-name">{comp.kind_name}</span>
+                              </div>
+                              {comp.source ? (
+                                <>
+                                  {(!download || download.status === 'error') && (
+                                    <button
+                                      className="hf-download-btn"
+                                      onClick={() => startHfDownload(comp.source.repo, comp.source.filename, comp.target_path, comp.source.target_filename)}
+                                    >
+                                      Download {comp.source.filename} ({comp.source.repo})
+                                    </button>
+                                  )}
+                                  {download && download.status === 'downloading' && (
+                                    <>
+                                      <div className="hf-progress-bar">
+                                        <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                                      </div>
+                                      <div className="hf-progress-row">
+                                        <span className="hf-progress-text">
+                                          {formatFileSize(download.downloaded_bytes)} / {formatFileSize(download.total_bytes)}
+                                        </span>
+                                      </div>
+                                    </>
+                                  )}
+                                  {download && download.status === 'complete' && (
+                                    <span className="modal-list-item-meta">Downloaded — retrying generation…</span>
+                                  )}
+                                  {download && download.status === 'error' && (
+                                    <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>
+                                      Download failed{download.error ? `: ${download.error}` : ''}
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="modal-list-item-meta">
+                                  No known auto-download source — place a file manually at: {comp.target_path}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
 
                 <div className="card">
@@ -2863,9 +3094,16 @@ function AppInner() {
                     />
                   </div>
 
-                  <button className="btn-primary" onClick={handleSynthesizeSpeech} disabled={isGeneratingTts}>
-                    <Play size={16} /> {isGeneratingTts ? 'Synthesizing...' : 'Synthesize Speech'}
-                  </button>
+                  <div className="gen-btn-row">
+                    <button className="btn-primary" onClick={handleSynthesizeSpeech} disabled={isGeneratingTts}>
+                      <Play size={16} /> {isGeneratingTts ? 'Synthesizing...' : 'Synthesize Speech'}
+                    </button>
+                    {isGeneratingTts && (
+                      <button className="btn-cancel-gen" onClick={() => cancelGenerationJob(activeTtsJobId)}>
+                        <X size={16} /> Cancel
+                      </button>
+                    )}
+                  </div>
                   {isGeneratingTts && <GenProgressBar progress={ttsProgress} />}
 
                   {audioSrc && <audio controls autoPlay src={audioSrc} style={{ width: '100%', marginTop: '1rem' }} />}
@@ -2934,7 +3172,7 @@ function AppInner() {
 
                   {mesh3dInputKind === 'text' && (
                     <div className="form-group">
-                      <label>Prompt</label>
+                      <label>Prompt <span className="field-required-badge">Required</span></label>
                       <textarea
                         rows={4}
                         style={{ height: 'auto' }}
@@ -2946,7 +3184,7 @@ function AppInner() {
 
                   {mesh3dInputKind === 'image' && (
                     <div className="form-group">
-                      <label>Source Image</label>
+                      <label>Source Image <span className="field-required-badge">Required</span></label>
                       <input
                         ref={mesh3dImageInputRef}
                         type="file"
@@ -2971,7 +3209,7 @@ function AppInner() {
 
                   {mesh3dInputKind === 'multi_image' && (
                     <div className="form-group">
-                      <label>Source Images</label>
+                      <label>Source Images <span className="field-required-badge">Required</span></label>
                       <input
                         ref={mesh3dMultiImageInputRef}
                         type="file"
@@ -2995,45 +3233,60 @@ function AppInner() {
                     </div>
                   )}
 
-                  <div style={{ display: 'flex', gap: '1rem' }}>
-                    <div className="form-group" style={{ flex: 1 }}>
-                      <label>Steps</label>
-                      <input
-                        type="number"
-                        value={mesh3dSteps}
-                        onChange={e => setMesh3dSteps(e.target.value)}
-                      />
-                    </div>
-                    <div className="form-group" style={{ flex: 1 }}>
-                      <label>Guidance Scale</label>
-                      <input
-                        type="number"
-                        step="0.5"
-                        value={mesh3dGuidance}
-                        onChange={e => setMesh3dGuidance(e.target.value)}
-                      />
-                    </div>
-                  </div>
+                  {/* Per-adapter tunable params, rendered generically from
+                      GET /v1/models3d/schema — see mesh3dAdapterParams. */}
+                  {mesh3dAdapterParams.map(p => {
+                    const value = mesh3dParamValues[p.name];
+                    if (p.type === 'bool') {
+                      return (
+                        <div className="slider-header" style={{ marginBottom: '1rem' }} key={p.name}>
+                          <div><strong>{p.name}</strong></div>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(value)}
+                            onChange={e => setMesh3dParam(p.name, e.target.checked)}
+                          />
+                        </div>
+                      );
+                    }
+                    let control;
+                    if (p.type === 'enum') {
+                      control = (
+                        <select value={value ?? ''} onChange={e => setMesh3dParam(p.name, e.target.value)}>
+                          {(p.choices || []).map(choice => <option key={choice} value={choice}>{choice}</option>)}
+                        </select>
+                      );
+                    } else if (p.type === 'int' || p.type === 'float') {
+                      control = (
+                        <input
+                          type="number"
+                          step={p.type === 'float' ? '0.1' : '1'}
+                          min={p.min ?? undefined}
+                          max={p.max ?? undefined}
+                          value={value ?? ''}
+                          onChange={e => setMesh3dParam(p.name, e.target.value === '' ? null : Number(e.target.value))}
+                        />
+                      );
+                    } else {
+                      control = <input type="text" value={value ?? ''} onChange={e => setMesh3dParam(p.name, e.target.value)} />;
+                    }
+                    return <div className="form-group" key={p.name}><label>{p.name}</label>{control}</div>;
+                  })}
+                  {!mesh3dSchema && (
+                    <p className="slider-hint" style={{ marginBottom: '1rem' }}>
+                      Model-specific parameters are unavailable (could not reach the daemon's schema endpoint). Generation will use each backend's own defaults.
+                    </p>
+                  )}
 
-                  <div style={{ display: 'flex', gap: '1rem' }}>
-                    <div className="form-group" style={{ flex: 1 }}>
-                      <label>Seed <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(-1 = random)</span></label>
-                      <input
-                        type="number"
-                        value={mesh3dSeed}
-                        onChange={e => setMesh3dSeed(e.target.value)}
-                      />
-                    </div>
-                    <div className="form-group" style={{ flex: 1 }}>
-                      <label>Output Format</label>
-                      <select value={mesh3dFormat} onChange={e => setMesh3dFormat(e.target.value)}>
-                        <option value="glb">GLB</option>
-                        <option value="obj">OBJ</option>
-                        <option value="ply">PLY</option>
-                        <option value="stl">STL</option>
-                        <option value="fbx">FBX</option>
-                      </select>
-                    </div>
+                  <div className="form-group">
+                    <label>Output Format</label>
+                    <select value={mesh3dFormat} onChange={e => setMesh3dFormat(e.target.value)}>
+                      <option value="glb">GLB</option>
+                      <option value="obj">OBJ</option>
+                      <option value="ply">PLY</option>
+                      <option value="stl">STL</option>
+                      <option value="fbx">FBX</option>
+                    </select>
                   </div>
 
                   <div className="slider-header" style={{ marginBottom: '1rem' }}>
@@ -3041,9 +3294,21 @@ function AppInner() {
                     <input type="checkbox" checked={mesh3dTexture} onChange={e => setMesh3dTexture(e.target.checked)} />
                   </div>
 
-                  <button className="btn-primary" onClick={handleGenerateMesh3d} disabled={isGeneratingMesh}>
-                    <Boxes size={16} /> {isGeneratingMesh ? 'Generating...' : 'Generate 3D Model'}
-                  </button>
+                  {mesh3dMissingField && (
+                    <p className="field-validation-warning">
+                      {mesh3dMissingField === 'prompt' ? 'Enter a prompt before generating.' : 'Attach a source image before generating.'}
+                    </p>
+                  )}
+                  <div className="gen-btn-row">
+                    <button className="btn-primary" onClick={handleGenerateMesh3d} disabled={isGeneratingMesh || Boolean(mesh3dMissingField)}>
+                      <Boxes size={16} /> {isGeneratingMesh ? 'Generating...' : 'Generate 3D Model'}
+                    </button>
+                    {isGeneratingMesh && (
+                      <button className="btn-cancel-gen" onClick={() => cancelGenerationJob(activeMeshJobId)}>
+                        <X size={16} /> Cancel
+                      </button>
+                    )}
+                  </div>
                   {isGeneratingMesh && <GenProgressBar progress={meshProgress} />}
                 </div>
 

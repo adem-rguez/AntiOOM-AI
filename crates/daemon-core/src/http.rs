@@ -77,6 +77,8 @@ pub struct AppState {
     pub hf_cancel: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Progress records for in-progress/completed generation jobs (image/mesh/tts), keyed by job_id.
     pub job_progress: Arc<tokio::sync::Mutex<HashMap<String, GenerationProgress>>>,
+    /// Cancellation flags for in-progress generation jobs (image/mesh/tts), keyed by job_id.
+    pub job_cancel: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Model paths the user has added to the Model Studio in the frontend.
     /// `list_models` filters the catalog down to only these when non-empty.
     pub studio_models: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
@@ -213,6 +215,11 @@ pub struct Mesh3dGenerationRequest {
     pub foreground_ratio: Option<f32>,
     #[serde(default)]
     pub job_id: Option<String>,
+    /// Any adapter-specific parameters not matching the named fields above
+    /// (e.g. SF3D's `remesh_option`/`target_vertex_count`) — passed straight
+    /// through to the Python `threed_server.py` process untouched.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +272,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/media/:id", get(get_media))
         .route("/v1/images/generations", post(generate_images))
         .route("/v1/models3d/generations", post(generate_mesh3d))
+        .route("/v1/models3d/schema", get(get_mesh3d_schema))
         .route("/v1/audio/transcriptions", post(transcribe_audio))
         .route("/v1/audio/speech", post(synthesize_speech))
         .route("/v1/fit-estimator", post(estimate_model_fit))
@@ -289,6 +297,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/model/delete", post(delete_model))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/:id/progress", get(get_job_progress))
+        .route("/v1/jobs/:id/cancel", post(cancel_job))
         .with_state(state)
 }
 
@@ -1390,6 +1399,7 @@ async fn stream_chat_completions(
             let status_event = serde_json::json!({
                 "type": "tool_status",
                 "tool_name": tool_call.name,
+                "arguments": tool_call.arguments,
                 "status": "executing",
                 "job_id": job_id,
             });
@@ -1412,6 +1422,7 @@ async fn stream_chat_completions(
             let mut result_event = serde_json::json!({
                 "type": "tool_result",
                 "tool_name": tool_call.name,
+                "arguments": tool_call.arguments,
                 "content": result.content,
                 "is_error": result.is_error,
                 "job_id": job_id,
@@ -1552,6 +1563,7 @@ async fn stream_chat_completions(
             let status_event = serde_json::json!({
                 "type": "tool_status",
                 "tool_name": tool_call.name,
+                "arguments": tool_call.arguments,
                 "status": "executing",
                 "job_id": job_id,
             });
@@ -1575,6 +1587,7 @@ async fn stream_chat_completions(
             let mut result_event = serde_json::json!({
                 "type": "tool_result",
                 "tool_name": tool_call.name,
+                "arguments": tool_call.arguments,
                 "content": result.content,
                 "is_error": result.is_error,
                 "job_id": job_id,
@@ -2076,34 +2089,77 @@ pub(crate) fn spawn_progress_poller(
     })
 }
 
-/// Finalize a job's progress record as done or errored.
+/// Finalize a job's progress record as done or errored. A `error` message
+/// exactly matching `BackendError::Cancelled`'s Display text is reported as
+/// a "cancelled" status/phase rather than a generic "error", so the frontend
+/// can distinguish a user-initiated cancellation from a real failure.
 pub(crate) async fn finalize_job_progress(state: &AppState, job_id: &str, modality: &str, error: Option<&str>) {
+    let cancelled = error == Some("Generation cancelled");
+    let status = if cancelled { "cancelled" } else if error.is_some() { "error" } else { "done" };
     let mut jobs = state.job_progress.lock().await;
     jobs.insert(
         job_id.to_string(),
         GenerationProgress {
             job_id: job_id.to_string(),
             modality: modality.to_string(),
-            phase: if error.is_some() { "error".to_string() } else { "done".to_string() },
+            phase: status.to_string(),
             step: 0,
             total: 0,
             percent: if error.is_some() { -1.0 } else { 100.0 },
-            status: if error.is_some() { "error".to_string() } else { "done".to_string() },
+            status: status.to_string(),
             message: error.map(|e| e.to_string()),
             updated_at: now_millis(),
         },
     );
 }
 
+/// Error type for `generate_images`, so a `BackendError::MissingComponents`
+/// can be surfaced as a structured 422 JSON body (for the frontend's
+/// "download missing components" fix) while every other error path keeps the
+/// existing plain-text response shape.
+enum GenerateImagesError {
+    Simple(axum::http::StatusCode, String),
+    MissingComponents(Vec<backend_trait::MissingComponentInfo>),
+}
+
+impl axum::response::IntoResponse for GenerateImagesError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            GenerateImagesError::Simple(status, msg) => (status, msg).into_response(),
+            GenerateImagesError::MissingComponents(list) => {
+                let missing_components: Vec<serde_json::Value> = list
+                    .into_iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "kind_name": c.kind_name,
+                            "target_path": c.target_path,
+                            "source": c.source.map(|s| serde_json::json!({
+                                "repo": s.repo,
+                                "filename": s.filename,
+                                "target_filename": s.target_filename,
+                            })),
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({
+                    "error": "Missing required components",
+                    "missing_components": missing_components,
+                });
+                (axum::http::StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+            }
+        }
+    }
+}
+
 async fn generate_images(
     State(state): State<AppState>,
     Json(payload): Json<ImageGenerationRequest>,
-) -> Result<Json<ImageGenerationResponse>, (axum::http::StatusCode, String)> {
+) -> Result<Json<ImageGenerationResponse>, GenerateImagesError> {
     let backend_arc = state
         .registry
         .get_backend(Modality::Image)
         .await
-        .ok_or((
+        .ok_or(GenerateImagesError::Simple(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "No image backend registered".to_string(),
         ))?;
@@ -2146,6 +2202,7 @@ async fn generate_images(
         image_params: Some(image_params),
         mesh_params: None,
         audio_params: None,
+        cancel: None,
     };
 
     {
@@ -2169,16 +2226,30 @@ async fn generate_images(
         done_flag.clone(),
     );
 
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state.job_cancel.lock().await.insert(job_id.clone(), cancel_flag.clone());
+    let mut inf_req = inf_req;
+    inf_req.cancel = Some(cancel_flag);
+
     let backend = backend_arc.read().await;
     let inf_res = backend.generate(inf_req).await;
     done_flag.store(true, AtomicOrdering::Relaxed);
     poller.abort();
+    state.job_cancel.lock().await.remove(&job_id);
 
     let inf_res = match inf_res {
         Ok(res) => res,
         Err(e) => {
             finalize_job_progress(&state, &job_id, "image", Some(&e.to_string())).await;
-            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(match e {
+                backend_trait::BackendError::MissingComponents(list) => {
+                    GenerateImagesError::MissingComponents(list)
+                }
+                other => GenerateImagesError::Simple(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    other.to_string(),
+                ),
+            });
         }
     };
     finalize_job_progress(&state, &job_id, "image", None).await;
@@ -2243,6 +2314,7 @@ async fn generate_mesh3d(
         output_format: payload.output_format.clone(),
         texture: payload.texture,
         foreground_ratio: payload.foreground_ratio,
+        extra: payload.extra.clone(),
     };
 
     let inf_req = InferenceRequest {
@@ -2257,6 +2329,7 @@ async fn generate_mesh3d(
         image_params: None,
         mesh_params: Some(mesh_params),
         audio_params: None,
+        cancel: None,
     };
 
     init_job_progress(&state, &job_id, "mesh").await;
@@ -2269,10 +2342,16 @@ async fn generate_mesh3d(
         done_flag.clone(),
     );
 
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state.job_cancel.lock().await.insert(job_id.clone(), cancel_flag.clone());
+    let mut inf_req = inf_req;
+    inf_req.cancel = Some(cancel_flag);
+
     let backend = backend_arc.read().await;
     let inf_res = backend.generate(inf_req).await;
     done_flag.store(true, AtomicOrdering::Relaxed);
     poller.abort();
+    state.job_cancel.lock().await.remove(&job_id);
 
     let inf_res = match inf_res {
         Ok(res) => res,
@@ -2303,6 +2382,31 @@ async fn generate_mesh3d(
     }))
 }
 
+/// Proxies `GET /schema` from the running `threed_server.py` process, exposing
+/// each 3D adapter's declared parameter spec so a future UI can build a
+/// dynamic parameter form.
+async fn get_mesh3d_schema(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let backend_arc = state
+        .registry
+        .get_backend(Modality::Mesh3D)
+        .await
+        .ok_or((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No 3D backend registered".to_string(),
+        ))?;
+
+    let backend = backend_arc.read().await;
+    match backend.get_param_schema().await {
+        Some(schema) => Ok(Json(schema)),
+        None => Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "3D backend has no schema available (not loaded or running in simulation mode)".to_string(),
+        )),
+    }
+}
+
 async fn transcribe_audio(
     State(state): State<AppState>,
 ) -> Result<Json<TranscriptionResponse>, (axum::http::StatusCode, String)> {
@@ -2329,6 +2433,7 @@ async fn transcribe_audio(
         image_params: None,
         mesh_params: None,
         audio_params: None,
+        cancel: None,
     };
 
     {
@@ -2383,6 +2488,7 @@ async fn synthesize_speech(
         image_params: None,
         mesh_params: None,
         audio_params: Some(backend_trait::AudioParams { speed: payload.speed }),
+        cancel: None,
     };
 
     {
@@ -2413,8 +2519,14 @@ async fn synthesize_speech(
 
     init_job_progress(&state, &job_id, "tts").await;
 
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state.job_cancel.lock().await.insert(job_id.clone(), cancel_flag.clone());
+    let mut inf_req = inf_req;
+    inf_req.cancel = Some(cancel_flag);
+
     let backend = backend_arc.read().await;
     let inf_res = backend.generate(inf_req).await;
+    state.job_cancel.lock().await.remove(&job_id);
 
     let inf_res = match inf_res {
         Ok(res) => res,
@@ -2490,6 +2602,27 @@ async fn get_job_progress(
         .cloned()
         .map(Json)
         .ok_or(axum::http::StatusCode::NOT_FOUND)
+}
+
+/// Signal cancellation of an in-flight generation job (image/mesh/tts, either
+/// started directly via `/v1/images|models3d|audio` or by the orchestrator's
+/// `run_model` tool). Sets the job's cancel flag; the backend polls it and
+/// aborts the in-flight `sd.exe` process / HTTP request cooperatively.
+async fn cancel_job(
+    State(state): State<AppState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let cancel_map = state.job_cancel.lock().await;
+    match cancel_map.get(&job_id) {
+        Some(flag) => {
+            flag.store(true, AtomicOrdering::Relaxed);
+            (axum::http::StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "job not found" })),
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2672,7 +2805,7 @@ fn detect_model_modality(path: &std::path::Path) -> String {
                 "tts".to_string()
             } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
                 "audio".to_string()
-            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") || file_name.contains("qwen-image") || file_name.contains("image-edit") {
+            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") || file_name.contains("qwen-image") || file_name.contains("image-edit") || file_name.contains("z-image") || file_name.contains("z_image") {
                 "image".to_string()
             } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
                 "video".to_string()
@@ -3658,6 +3791,18 @@ async fn hf_files(
 struct HfDownloadRequest {
     repo: String,
     filename: String,
+    /// Optional destination subfolder relative to the models root (e.g.
+    /// "shared/vae"). When set alongside `target_filename`, overrides the
+    /// default `<models_dir>/<sanitized repo id>/<filename>` layout — used
+    /// to drop split-checkpoint components (VAE, text encoders) straight
+    /// into sd-backend's shared components folders.
+    #[serde(default)]
+    target_dir: Option<String>,
+    /// Optional destination filename, used together with `target_dir`. Lets
+    /// an upstream file (e.g. BFL's `ae.safetensors`) be saved under a
+    /// renamed filename that satisfies `ComponentKind::filename_patterns()`.
+    #[serde(default)]
+    target_filename: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3673,10 +3818,15 @@ async fn hf_download(
     let models_dir = resolve_models_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("models"));
     // Save each repo's files into its own subfolder so config.json/tokenizer.json
-    // from different models don't collide in the shared models/ root.
-    let save_path = models_dir
-        .join(sanitize_repo_id(&payload.repo))
-        .join(&payload.filename);
+    // from different models don't collide in the shared models/ root — unless
+    // the caller explicitly asked for a specific destination (e.g. dropping a
+    // split-checkpoint component into models/shared/vae).
+    let save_path = match (&payload.target_dir, &payload.target_filename) {
+        (Some(dir), Some(name)) => models_dir.join(dir).join(name),
+        _ => models_dir
+            .join(sanitize_repo_id(&payload.repo))
+            .join(&payload.filename),
+    };
     let save_path_string = save_path.to_string_lossy().to_string();
 
     {
@@ -4363,6 +4513,24 @@ pub(crate) async fn load_model(
     Ok(Json(entry))
 }
 
+/// Map the `modality` string stored on a `LoadedModelEntry` (as produced by
+/// `detect_model_modality` / `detect_hf_config_dir_modality`) to the backend
+/// registry's `Modality` enum, but only for modalities whose load path
+/// dispatches to a registered `InferenceBackend` (see the `match modality.as_str()`
+/// arms in `load_model`). "text"/"vision" models are spawned directly as a
+/// llama-server child keyed by model_id and are fully handled by
+/// `state.children.take`, so they intentionally return `None` here.
+fn modality_backend_for_unload(modality: &str) -> Option<Modality> {
+    match modality {
+        "tts" => Some(Modality::AudioTts),
+        "audio" => Some(Modality::AudioAsr),
+        "image" => Some(Modality::Image),
+        "video" => Some(Modality::Video),
+        "mesh3d" => Some(Modality::Mesh3D),
+        _ => None,
+    }
+}
+
 /// Unload a model by model_id. Kills its llama-server process.
 async fn unload_model(
     State(state): State<AppState>,
@@ -4388,6 +4556,20 @@ async fn unload_model(
                     e.port
                 )])
                 .spawn();
+            // Non-llama-server modalities (image/mesh3d/tts/audio/video) don't
+            // register a child in `state.children` at load time — their
+            // process is owned by the backend itself. Tear it down via the
+            // backend trait so VRAM/metrics don't keep reporting it as loaded.
+            if let Some(backend_modality) = modality_backend_for_unload(&e.modality) {
+                if let Some(backend_arc) = state.registry.get_backend(backend_modality).await {
+                    let mut b = backend_arc.write().await;
+                    if let Err(err) = b.unload_model().await {
+                        tracing::warn!("unload_model: backend unload for '{}' ({}) failed: {}", mid, e.modality, err);
+                    }
+                } else {
+                    tracing::warn!("unload_model: no backend registered for modality '{}' (model '{}')", e.modality, mid);
+                }
+            }
         }
     } else {
         // Legacy unload: kill everything via the backend trait

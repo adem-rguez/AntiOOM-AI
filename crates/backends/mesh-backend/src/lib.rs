@@ -178,7 +178,7 @@ impl MeshBackend {
             .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
             .collect();
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "prompt": prompt,
             "images": images_b64,
             "input_kind": params.input_kind,
@@ -189,6 +189,13 @@ impl MeshBackend {
             "texture": params.texture,
             "foreground_ratio": params.foreground_ratio,
         });
+        // Pass any adapter-specific params (e.g. SF3D's `remesh_option`) straight
+        // through to threed_server.py, untouched by the named fields above.
+        if let serde_json::Value::Object(map) = &mut payload {
+            for (key, value) in params.extra.iter() {
+                map.insert(key.clone(), value.clone());
+            }
+        }
 
         let url = format!("http://127.0.0.1:{}/generate", port);
         let response = client
@@ -433,5 +440,19 @@ impl InferenceBackend for MeshBackend {
             return None;
         }
         Self::poll_threed_progress(self.port).await
+    }
+
+    async fn get_param_schema(&self) -> Option<serde_json::Value> {
+        if self.process.is_none() {
+            // No threed_server.py running (simulation mode) — no schema source.
+            return None;
+        }
+        let client = reqwest::Client::builder().no_proxy().build().ok()?;
+        let url = format!("http://127.0.0.1:{}/schema", self.port);
+        let response = client.get(&url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
     }
 }

@@ -52,6 +52,18 @@ impl ComponentKind {
     }
 }
 
+/// A known default HuggingFace download source for a missing component.
+/// `target_filename` is the destination filename after download (may differ
+/// from `filename` when the upstream file needs renaming to satisfy
+/// `ComponentKind::filename_patterns()`, e.g. BFL's `ae.safetensors` ->
+/// something containing "vae").
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultSource {
+    pub repo: &'static str,
+    pub filename: &'static str,
+    pub target_filename: &'static str,
+}
+
 /// Everything `sd.exe` needs to know to run a given architecture family in
 /// component (split-checkpoint) mode.
 pub struct ComponentSpec {
@@ -67,6 +79,21 @@ pub struct ComponentSpec {
     pub default_cfg_scale: Option<f32>,
     /// Applied to `ImageParams.steps` only when the caller didn't set one.
     pub default_steps: Option<u32>,
+    /// Known default download sources for specific components, where the
+    /// real upstream HF repo is confidently known. Not populated for every
+    /// `ComponentKind` — missing entries just mean "no known auto-download
+    /// source yet".
+    pub default_source: Option<&'static [(ComponentKind, DefaultSource)]>,
+}
+
+impl ComponentSpec {
+    /// Look up the known default download source for `kind`, if any.
+    pub fn default_source_for(&self, kind: &ComponentKind) -> Option<DefaultSource> {
+        self.default_source?
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, src)| *src)
+    }
 }
 
 struct FamilyEntry {
@@ -88,6 +115,7 @@ static FAMILIES: &[FamilyEntry] = &[
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
+            default_source: None,
         },
     },
     // Z-Image (reuses Flux1's VAE format).
@@ -100,6 +128,24 @@ static FAMILIES: &[FamilyEntry] = &[
             model_args: None,
             default_cfg_scale: Some(1.0),
             default_steps: Some(8),
+            default_source: Some(&[
+                (
+                    ComponentKind::Llm("qwen3"),
+                    DefaultSource {
+                        repo: "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+                        filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                        target_filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                    },
+                ),
+                (
+                    ComponentKind::Vae,
+                    DefaultSource {
+                        repo: "black-forest-labs/FLUX.1-schnell",
+                        filename: "ae.safetensors",
+                        target_filename: "flux-vae.safetensors",
+                    },
+                ),
+            ]),
         },
     },
     // Qwen-Image.
@@ -112,6 +158,7 @@ static FAMILIES: &[FamilyEntry] = &[
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
+            default_source: None,
         },
     },
     // SD3 / SD3.5.
@@ -124,6 +171,7 @@ static FAMILIES: &[FamilyEntry] = &[
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
+            default_source: None,
         },
     },
     // Chroma (Flux1-derived).
@@ -136,6 +184,14 @@ static FAMILIES: &[FamilyEntry] = &[
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
+            default_source: Some(&[(
+                ComponentKind::Vae,
+                DefaultSource {
+                    repo: "black-forest-labs/FLUX.1-schnell",
+                    filename: "ae.safetensors",
+                    target_filename: "flux-vae.safetensors",
+                },
+            )]),
         },
     },
     // Flux1 fallback — must come after flux2's patterns above.
@@ -148,6 +204,14 @@ static FAMILIES: &[FamilyEntry] = &[
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
+            default_source: Some(&[(
+                ComponentKind::Vae,
+                DefaultSource {
+                    repo: "black-forest-labs/FLUX.1-schnell",
+                    filename: "ae.safetensors",
+                    target_filename: "flux-vae.safetensors",
+                },
+            )]),
         },
     },
 ];

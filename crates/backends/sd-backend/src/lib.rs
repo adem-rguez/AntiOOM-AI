@@ -221,16 +221,30 @@ impl SdBackend {
 
     /// Parse a whitespace-delimited `N/M` step token (e.g. from a
     /// `  |====>  | 3/20 - 1.50it/s` sd.exe progress line) out of a chunk of
-    /// stderr text. Returns `Some((step, total))` for the last such token
-    /// found in the chunk, ignoring tokens like `1.50it/s` that don't parse
-    /// as two integers.
+    /// stdout text. sd.exe's stdout carries several different `N/M`-shaped
+    /// progress bars (the real per-step sampling counter, but also
+    /// tensor-loading/VAE-decode counters and plain log lines like
+    /// `generating image: 1/1 - seed 42`), so a match is only accepted as
+    /// the real step counter if the token immediately following it looks
+    /// like a per-iteration rate (contains `it/s` or ends with `s/it`,
+    /// case-insensitive) rather than a throughput rate (`b/s`) or something
+    /// else entirely. Returns `Some((step, total))` for the last such valid
+    /// token found in the chunk.
     fn parse_step_total(line: &str) -> Option<(u32, u32)> {
         let mut found = None;
-        for tok in line.split_whitespace() {
+        let mut tokens = line.split_whitespace().peekable();
+        while let Some(tok) = tokens.next() {
             if let Some((a, b)) = tok.split_once('/') {
                 if let (Ok(step), Ok(total)) = (a.parse::<u32>(), b.parse::<u32>()) {
                     if total > 0 {
-                        found = Some((step, total));
+                        if let Some(next) = tokens.peek() {
+                            let next_lower = next.to_ascii_lowercase();
+                            let is_iter_rate = next_lower.contains("it/s") || next_lower.ends_with("s/it");
+                            let is_throughput_rate = next_lower.ends_with("b/s");
+                            if is_iter_rate && !is_throughput_rate {
+                                found = Some((step, total));
+                            }
+                        }
                     }
                 }
             }
@@ -340,6 +354,7 @@ impl SdBackend {
         let mut t5xxl = None;
         let mut llm = None;
         let mut vae = None;
+        let mut missing: Vec<backend_trait::MissingComponentInfo> = Vec::new();
 
         for kind in spec.components {
             let resolved = Self::resolve_component(kind, diffusion_dir, models_root.as_deref());
@@ -355,15 +370,26 @@ impl SdBackend {
                     let shared_dir = models_root
                         .as_ref()
                         .map(|root| root.join(kind.shared_subdir().replace('/', std::path::MAIN_SEPARATOR_STR)))
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| format!("models/{}", kind.shared_subdir()));
-                    return Err(BackendError::InferenceError(format!(
-                        "'{}' ({} family) needs a {} component, but none was found next to the \
-                         diffusion model or in the shared components folder. Place it at: {}",
-                        filename, spec.family, kind.display_name(), shared_dir
-                    )));
+                        .unwrap_or_else(|| PathBuf::from(format!("models/{}", kind.shared_subdir())));
+                    let source = spec.default_source_for(kind).map(|src| {
+                        backend_trait::MissingComponentSource {
+                            repo: src.repo.to_string(),
+                            filename: src.filename.to_string(),
+                            target_filename: src.target_filename.to_string(),
+                        }
+                    });
+                    let target_path = shared_dir.display().to_string();
+                    missing.push(backend_trait::MissingComponentInfo {
+                        kind_name: kind.display_name().to_string(),
+                        target_path,
+                        source,
+                    });
                 }
             }
+        }
+
+        if !missing.is_empty() {
+            return Err(BackendError::MissingComponents(missing));
         }
 
         let vae = vae.ok_or_else(|| {
@@ -401,6 +427,7 @@ impl SdBackend {
         cfg_scale_override: Option<f32>,
         steps_override: Option<u32>,
         gguf_progress: &Arc<Mutex<GgufProgress>>,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<u8>, BackendError> {
         let out_path = std::env::temp_dir().join(format!("dispos_sd_{}.png", request_id));
         let total_steps = params.steps.or(steps_override).unwrap_or(20);
@@ -455,7 +482,7 @@ impl SdBackend {
             cmd.arg("-s").arg(seed.to_string());
         }
         cmd.arg("-o").arg(&out_path);
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         {
             let mut progress = gguf_progress.lock().unwrap();
@@ -470,8 +497,14 @@ impl SdBackend {
             .map_err(|e| BackendError::InferenceError(format!("Failed to run sd.exe: {}", e)))?;
 
         let stderr = child.stderr.take();
+        let stdout = child.stdout.take();
         let mut stderr_buf = Vec::new();
 
+        // sd.exe writes its per-step sampling progress bar to stdout (with
+        // `\r`-delimited updates), not stderr; stderr only carries a
+        // startup banner and, on failure, error text. Read both streams
+        // concurrently: stdout drives live progress, stderr is preserved
+        // for its existing error-message role.
         let read_task = if let Some(stderr) = stderr {
             let progress = gguf_progress.clone();
             Some(tokio::spawn(async move {
@@ -518,21 +551,93 @@ impl SdBackend {
             None
         };
 
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| BackendError::InferenceError(format!("Failed to wait on sd.exe: {}", e)))?;
+        let stdout_task = if let Some(stdout) = stdout {
+            let progress = gguf_progress.clone();
+            Some(tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = stdout;
+                let mut buf = [0u8; 4096];
+                let mut line_acc: Vec<u8> = Vec::new();
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for &b in &buf[..n] {
+                                if b == b'\r' || b == b'\n' {
+                                    if !line_acc.is_empty() {
+                                        let line = String::from_utf8_lossy(&line_acc).to_string();
+                                        if let Some((step, total)) = Self::parse_step_total(&line) {
+                                            let mut p = progress.lock().unwrap();
+                                            p.step = step;
+                                            p.total = total;
+                                        }
+                                        line_acc.clear();
+                                    }
+                                } else {
+                                    line_acc.push(b);
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !line_acc.is_empty() {
+                    let line = String::from_utf8_lossy(&line_acc).to_string();
+                    if let Some((step, total)) = Self::parse_step_total(&line) {
+                        let mut p = progress.lock().unwrap();
+                        p.step = step;
+                        p.total = total;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Race the child's exit against a cancellation poll loop, so a
+        // caller-set `cancel` flag can abort a running `sd.exe` process.
+        let wait_result: Result<std::process::ExitStatus, BackendError> = if let Some(cancel) = cancel {
+            let cancel = cancel.clone();
+            let cancel_wait = async {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            };
+            tokio::select! {
+                status = child.wait() => {
+                    status.map_err(|e| BackendError::InferenceError(format!("Failed to wait on sd.exe: {}", e)))
+                }
+                _ = cancel_wait => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    Err(BackendError::Cancelled)
+                }
+            }
+        } else {
+            child
+                .wait()
+                .await
+                .map_err(|e| BackendError::InferenceError(format!("Failed to wait on sd.exe: {}", e)))
+        };
 
         if let Some(task) = read_task {
             if let Ok(bytes) = task.await {
                 stderr_buf = bytes;
             }
         }
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
 
         {
             let mut progress = gguf_progress.lock().unwrap();
             progress.active = false;
         }
+
+        let status = wait_result?;
 
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
@@ -563,9 +668,10 @@ impl SdBackend {
         prompt: &str,
         params: &ImageParams,
         gguf_progress: &Arc<Mutex<GgufProgress>>,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<u8>, BackendError> {
         let legacy_mode = SdCommandMode::Legacy(model_path.to_path_buf());
-        match Self::run_sd_exe(sd_binary, &legacy_mode, request_id, prompt, params, None, None, gguf_progress).await {
+        match Self::run_sd_exe(sd_binary, &legacy_mode, request_id, prompt, params, None, None, gguf_progress, cancel).await {
             Ok(bytes) => Ok(bytes),
             Err(BackendError::InferenceError(msg)) if msg.contains(SD_VERSION_SNIFF_FAILURE) => {
                 info!(
@@ -583,6 +689,7 @@ impl SdBackend {
                     default_cfg_scale,
                     default_steps,
                     gguf_progress,
+                    cancel,
                 )
                 .await
             }
@@ -837,6 +944,7 @@ impl InferenceBackend for SdBackend {
                 &request.prompt,
                 &params,
                 &self.gguf_progress,
+                request.cancel.as_ref(),
             )
             .await?
         } else if self.process.is_some() {

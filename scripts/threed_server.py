@@ -52,6 +52,8 @@ Protocol:
         200: {"mesh_base64": "...", "format": "glb"}
         4xx/5xx: {"error": "..."}
     GET /capabilities -> {"input_kinds": [...], "pipeline": "...", "output_formats": [...]}
+    GET /schema -> {"<adapter_name>": {"params": [...PARAM_SPEC...]}, ...} for every
+        registered adapter (see `MeshAdapter.PARAM_SPEC` / `resolve_params()`).
     GET /health -> {"status": "ok"}
 
 Prints "READY" to stdout once the adapter is selected and the server is
@@ -234,6 +236,57 @@ def _to_trimesh(obj):
 
 
 # ---------------------------------------------------------------------------
+# Adapter parameter specs
+# ---------------------------------------------------------------------------
+#
+# Each adapter declares `PARAM_SPEC`: a list of dicts describing exactly the
+# params it reads out of the raw `/generate` JSON body, e.g.:
+#   {"name": "steps", "type": "int", "default": 64, "min": 1, "max": 150}
+# `type` is one of "float"|"int"|"bool"|"str"|"enum" ("enum" uses "choices").
+# `resolve_params()` applies default + type coercion + min/max/choices
+# clamping, so the spec is the actual source of truth for each adapter's
+# `generate()`, not just documentation. `GET /schema` serializes these specs
+# for every registered adapter.
+
+def _coerce_param(spec_item, raw_value):
+    """Apply one PARAM_SPEC item's type coercion, default, and min/max/choices
+    clamping to a single raw value pulled from the request body."""
+    ptype = spec_item.get("type", "str")
+    default = spec_item.get("default")
+
+    if raw_value is None:
+        value = default
+    else:
+        try:
+            if ptype == "float":
+                value = float(raw_value)
+            elif ptype == "int":
+                value = int(raw_value)
+            elif ptype == "bool":
+                value = bool(raw_value)
+            else:
+                value = raw_value
+        except (TypeError, ValueError):
+            value = default
+
+    if ptype in ("float", "int") and value is not None:
+        if spec_item.get("min") is not None:
+            value = max(spec_item["min"], value)
+        if spec_item.get("max") is not None:
+            value = min(spec_item["max"], value)
+    if ptype == "enum" and spec_item.get("choices") and value not in spec_item["choices"]:
+        value = default
+
+    return value
+
+
+def resolve_params(spec, params):
+    """Resolve a `{name: value}` dict from the raw `/generate` params according
+    to `spec` (a PARAM_SPEC list)."""
+    return {item["name"]: _coerce_param(item, params.get(item["name"])) for item in spec}
+
+
+# ---------------------------------------------------------------------------
 # Adapters
 # ---------------------------------------------------------------------------
 
@@ -244,12 +297,18 @@ class MeshAdapter:
     # Lowercase substrings of the combined "parent dir + file name" string
     # that select this adapter in `ADAPTER_REGISTRY`. See module docstring.
     match_tokens = []
+    # Declared generation params this adapter reads via `resolve_params()`.
+    # See "Adapter parameter specs" above.
+    PARAM_SPEC = []
 
     def __init__(self, model_path):
         self.model_path = model_path
 
     def is_available(self):
         return True
+
+    def resolve_params(self, params):
+        return resolve_params(self.PARAM_SPEC, params)
 
     def generate(self, input_kind, prompt, images, params):
         raise NotImplementedError
@@ -278,6 +337,11 @@ class ShapEAdapter(MeshAdapter):
     name = "shap-e"
     input_kinds = ["text", "image"]
     match_tokens = ["shap-e", "shap_e", "shape"]
+    PARAM_SPEC = [
+        {"name": "steps", "type": "int", "default": 64, "min": 1, "max": 150},
+        {"name": "guidance_scale", "type": "float", "default": 15.0, "min": 0.0, "max": 30.0},
+        {"name": "seed", "type": "int", "default": None},
+    ]
 
     def __init__(self, model_path):
         self.model_path = model_path
@@ -320,9 +384,10 @@ class ShapEAdapter(MeshAdapter):
         return self._img_pipe
 
     def generate(self, input_kind, prompt, images, params):
-        steps = int(params.get("steps") or 64)
-        guidance_scale = float(params.get("guidance_scale") or 15.0)
-        seed = params.get("seed")
+        resolved = self.resolve_params(params)
+        steps = resolved["steps"]
+        guidance_scale = resolved["guidance_scale"]
+        seed = resolved["seed"]
         generator = None
         if seed is not None:
             generator = torch.Generator(device=self._device()).manual_seed(int(seed))
@@ -391,6 +456,9 @@ class TripoSRAdapter(MeshAdapter):
     name = "triposr"
     input_kinds = ["image"]
     match_tokens = ["triposr", "tripo"]
+    PARAM_SPEC = [
+        {"name": "foreground_ratio", "type": "float", "default": 0.85, "min": 0.0, "max": 1.0},
+    ]
 
     def __init__(self, model_path):
         self.model_path = model_path
@@ -464,7 +532,7 @@ class TripoSRAdapter(MeshAdapter):
             raise ValueError("TripoSR requires an image input")
         model = self._load()
         image = images[0].convert("RGB")
-        foreground_ratio = float(params.get("foreground_ratio") or 0.85)
+        foreground_ratio = self.resolve_params(params)["foreground_ratio"]
         try:
             from tsr.utils import remove_background, resize_foreground
             import rembg
@@ -488,6 +556,9 @@ class SF3DAdapter(MeshAdapter):
     name = "stable-fast-3d"
     input_kinds = ["image"]
     match_tokens = ["sf3d", "stable-fast-3d", "stable_fast_3d"]
+    PARAM_SPEC = [
+        {"name": "foreground_ratio", "type": "float", "default": 0.85, "min": 0.0, "max": 1.0},
+    ]
 
     def __init__(self, model_path):
         self.model_path = model_path
@@ -515,7 +586,7 @@ class SF3DAdapter(MeshAdapter):
             raise ValueError("Stable Fast 3D requires an image input")
         model = self._load()
         image = images[0].convert("RGBA")
-        foreground_ratio = float(params.get("foreground_ratio") or 0.85)
+        foreground_ratio = self.resolve_params(params)["foreground_ratio"]
         try:
             import rembg
             from sf3d.utils import remove_background, resize_foreground
@@ -581,6 +652,9 @@ class TrellisAdapter(MeshAdapter):
     name = "trellis"
     input_kinds = ["text", "image", "multi_image"]
     match_tokens = ["trellis"]
+    PARAM_SPEC = [
+        {"name": "seed", "type": "int", "default": 0},
+    ]
 
     def __init__(self, model_path):
         self.model_path = model_path
@@ -621,7 +695,7 @@ class TrellisAdapter(MeshAdapter):
         return self._text_pipeline
 
     def generate(self, input_kind, prompt, images, params):
-        seed = int(params.get("seed") or 0)
+        seed = self.resolve_params(params)["seed"]
         if input_kind == "text":
             if not prompt:
                 raise ValueError("TRELLIS text-to-3D requires a prompt")
@@ -673,6 +747,11 @@ class Hunyuan3DAdapter(MeshAdapter):
     name = "hunyuan3d"
     input_kinds = ["text", "image", "multi_image"]
     match_tokens = ["hunyuan3d", "hunyuan-3d", "hunyuan_3d"]
+    PARAM_SPEC = [
+        {"name": "steps", "type": "int", "default": 30, "min": 1, "max": 150},
+        {"name": "guidance_scale", "type": "float", "default": 5.0, "min": 0.0, "max": 30.0},
+        {"name": "octree_resolution", "type": "int", "default": 256, "min": 64, "max": 512},
+    ]
 
     def __init__(self, model_path):
         self.model_path = model_path
@@ -895,9 +974,10 @@ class Hunyuan3DAdapter(MeshAdapter):
             raise ValueError("Hunyuan3D requires at least one image input")
         pipeline = self._load()
 
-        steps = int(params.get("steps") or 30)
-        guidance_scale = float(params.get("guidance_scale") or 5.0)
-        octree_resolution = int(params.get("octree_resolution") or 256)
+        resolved = self.resolve_params(params)
+        steps = resolved["steps"]
+        guidance_scale = resolved["guidance_scale"]
+        octree_resolution = resolved["octree_resolution"]
 
         result = pipeline(
             image=images[0],
@@ -915,6 +995,9 @@ class PointEAdapter(MeshAdapter):
     name = "point-e"
     input_kinds = ["text", "image"]
     match_tokens = ["point-e", "point_e", "pointe"]
+    PARAM_SPEC = [
+        {"name": "guidance_scale", "type": "float", "default": 3.0, "min": 0.0, "max": 30.0},
+    ]
 
     def __init__(self, model_path):
         self.model_path = model_path
@@ -949,7 +1032,7 @@ class PointEAdapter(MeshAdapter):
             diffusions=[diffusion],
             num_points=[1024],
             aux_channels=["R", "G", "B"],
-            guidance_scale=[float(params.get("guidance_scale") or 3.0)],
+            guidance_scale=[self.resolve_params(params)["guidance_scale"]],
             model_kwargs_key_filter=("texts",) if input_kind == "text" else ("*",),
         )
         model_kwargs = {"texts": [prompt or ""]} if input_kind == "text" else {}
@@ -1332,6 +1415,11 @@ class Handler(BaseHTTPRequestHandler):
                 "input_kinds": ADAPTER.input_kinds,
                 "pipeline": ADAPTER.name,
                 "output_formats": ADAPTER.output_formats,
+            })
+        elif self.path == "/schema":
+            self._send_json(200, {
+                adapter_cls.name: {"params": adapter_cls.PARAM_SPEC}
+                for adapter_cls in ADAPTER_REGISTRY
             })
         else:
             self._send_json(404, {"error": "not found"})

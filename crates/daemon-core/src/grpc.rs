@@ -61,6 +61,7 @@ impl DaemonService for DaemonGrpcService {
             image_params: None,
             mesh_params: None,
             audio_params: None,
+            cancel: None,
         };
 
         let backend = backend_arc.read().await;

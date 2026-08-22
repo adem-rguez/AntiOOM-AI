@@ -638,6 +638,27 @@ main {
   color: #f87171;
 }
 
+.tool-status-indicator.cancelled {
+  animation: none;
+  background: rgba(148, 163, 184, 0.1);
+  border-color: rgba(148, 163, 184, 0.25);
+  color: #94a3b8;
+}
+
+.tool-status-cancel-btn {
+  margin-left: auto;
+  background: none;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.tool-status-cancel-btn:hover { background: rgba(239, 68, 68, 0.15); }
+
 @keyframes toolPulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
@@ -915,6 +936,30 @@ input[type="text"], input[type="number"], select {
 }
 
 .btn-primary:hover { opacity: 0.9; }
+
+.gen-btn-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.btn-cancel-gen {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #ef4444;
+  font-weight: 600;
+  font-size: 0.88rem;
+  padding: 0.7rem 1.25rem;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-cancel-gen:hover { background: rgba(239, 68, 68, 0.2); }
+.btn-cancel-gen:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .preview-box {
   width: 100%;
@@ -1740,6 +1785,24 @@ input[type="text"], input[type="number"], select {
   font-size: 0.68rem;
   font-weight: 600;
   margin-left: 0.4rem;
+}
+
+.field-required-badge {
+  display: inline-block;
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--accent-amber);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.65rem;
+  font-weight: 600;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+}
+
+.field-validation-warning {
+  color: var(--accent-amber);
+  font-size: 0.75rem;
+  margin: -0.5rem 0 0.75rem;
 }
 
 .hf-results-panel {

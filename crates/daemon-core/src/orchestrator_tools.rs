@@ -211,9 +211,10 @@ async fn get_generation_progress(state: &AppState, tool_call: &ToolCall) -> Tool
 }
 
 async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str) -> ToolResult {
-    let (Some(target), Some(prompt)) = (arg(tool_call, "model"), arg(tool_call, "prompt")) else {
-        return err(tool_call, "run_model needs both 'model' and 'prompt'.".into());
+    let Some(target) = arg(tool_call, "model") else {
+        return err(tool_call, "run_model needs a 'model' argument.".into());
     };
+    let prompt = arg(tool_call, "prompt").unwrap_or("");
 
     // Resolve against what is already loaded, else load it from the catalog.
     let mut entry = find_loaded(state, target).await;
@@ -248,7 +249,12 @@ async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str) -> Tool
     info!("run_model: '{}' ({}) <- {:?}", entry.model_path, modality, prompt);
 
     match modality {
-        "text" | "vision" => run_text_model(state, tool_call, entry.port, prompt).await,
+        "text" | "vision" => {
+            if prompt.is_empty() {
+                return err(tool_call, "run_model needs a 'prompt' for text/vision models.".into());
+            }
+            run_text_model(state, tool_call, entry.port, prompt).await
+        }
         _ => {
             let image = match arg(tool_call, "image") {
                 Some(handle) => match resolve_media_handle(state, handle).await {
@@ -385,6 +391,7 @@ async fn run_media_model(
         image_params: None,
         mesh_params,
         audio_params: None,
+        cancel: None,
     };
 
     crate::http::init_job_progress(state, job_id, modality_static).await;
@@ -397,10 +404,24 @@ async fn run_media_model(
         done_flag.clone(),
     );
 
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.job_cancel.lock().await.insert(job_id.to_string(), cancel_flag.clone());
+    let mut request = request;
+    request.cancel = Some(cancel_flag);
+
     let backend = backend_arc.read().await;
     let gen_result = tokio::time::timeout(std::time::Duration::from_secs(180), backend.generate(request)).await;
     done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     poller.abort();
+    state.job_cancel.lock().await.remove(job_id);
+    drop(backend);
+
+    // Media backends (tts/audio/image/video/mesh3d) are invoked as one-shot orchestrator
+    // tools, unlike text models which stay resident across a conversation. Unload here to
+    // free VRAM/RAM for whichever model the orchestrator picks next.
+    if let Err(e) = backend_arc.write().await.unload_model().await {
+        tracing::warn!("Failed to unload {:?} backend after tool call: {}", backend_modality, e);
+    }
 
     match gen_result {
         Ok(Ok(response)) => {

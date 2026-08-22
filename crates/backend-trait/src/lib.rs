@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -143,6 +144,12 @@ pub struct Mesh3dParams {
     pub output_format: Option<String>,
     pub texture: Option<bool>,
     pub foreground_ratio: Option<f32>,
+    /// Any adapter-specific parameters not covered by the named fields above
+    /// (e.g. SF3D's `remesh_option`/`target_vertex_count`), passed straight
+    /// through to `threed_server.py` untouched. Populated from
+    /// `Mesh3dGenerationRequest`'s `#[serde(flatten)]` `extra` map.
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Parameters specific to speech-synthesis requests (Modality::AudioTts).
@@ -177,6 +184,13 @@ pub struct InferenceRequest {
     /// Speech-synthesis params (Modality::AudioTts only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_params: Option<AudioParams>,
+    /// Cooperative cancellation flag. Backends that support cancelling an
+    /// in-flight generation (e.g. sd-backend's `sd.exe` subprocess,
+    /// llama-backend's HTTP request) poll this and return
+    /// `BackendError::Cancelled` when it's set. Not (de)serialized — it's
+    /// only ever set in-process by daemon-core when it registers a job.
+    #[serde(skip)]
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +234,23 @@ pub struct InferenceChunk {
 
 pub type InferenceStream = Pin<Box<dyn Stream<Item = Result<InferenceChunk, BackendError>> + Send>>;
 
+/// A known default HuggingFace download source for a missing component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingComponentSource {
+    pub repo: String,
+    pub filename: String,
+    pub target_filename: String,
+}
+
+/// One missing split-checkpoint component (e.g. VAE, text encoder), reported
+/// so the frontend can offer a one-click download fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingComponentInfo {
+    pub kind_name: String,
+    pub target_path: String,
+    pub source: Option<MissingComponentSource>,
+}
+
 #[derive(Error, Debug)]
 pub enum BackendError {
     #[error("Model not loaded")]
@@ -232,6 +263,10 @@ pub enum BackendError {
     OutofVram { required_bytes: u64, available_bytes: u64 },
     #[error("Unsupported modality: {0:?}")]
     UnsupportedModality(Modality),
+    #[error("Missing required components")]
+    MissingComponents(Vec<MissingComponentInfo>),
+    #[error("Generation cancelled")]
+    Cancelled,
     #[error("Backend dynamic error: {0}")]
     Other(String),
 }
@@ -279,6 +314,14 @@ pub trait InferenceBackend: Send + Sync {
     /// Poll for progress on a currently-running generation. Backends without
     /// a progress source (most of them) keep the default `None`.
     async fn poll_progress(&self) -> Option<GenerationProgress> {
+        None
+    }
+
+    /// Fetch adapter parameter schemas (Mesh3D backends only), used to serve
+    /// `GET /v1/models3d/schema` so a future UI can build a dynamic parameter
+    /// form. Backends without an underlying schema source keep the default
+    /// `None`.
+    async fn get_param_schema(&self) -> Option<serde_json::Value> {
         None
     }
 }
